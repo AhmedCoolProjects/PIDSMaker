@@ -17,6 +17,7 @@ featurization:
   emb_dim: 16
   training_split: all
   used_method: hierarchical_hashing
+  seed: 0
 feat_inference:
   to_remove: True
 

@@ -6,6 +6,10 @@ __pycache__/
 # C extensions
 *.so
 
+postgres_tmpfs_data
+postgres_tmpfs_run
+postgres_tmpfs_log
+
 # Distribution / packaging
 .Python
 build/

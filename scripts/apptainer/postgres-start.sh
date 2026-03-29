@@ -24,9 +24,9 @@ fi
 # Configuration
 POSTGRES_IMAGE="postgres.sif"
 POSTGRES_INSTANCE="postgres_instance"
-DATA_DIR="postgres_data"
-RUN_DIR="postgres_run"
-LOG_DIR="postgres_log"
+DATA_DIR="/srv/lustre01/project/nlp_team-um6p-st-sccs-id7fz1zvotk/IDS/ahmed.bargady/forks/PIDSMaker/postgres_tmpfs_data"
+RUN_DIR="/srv/lustre01/project/nlp_team-um6p-st-sccs-id7fz1zvotk/IDS/ahmed.bargady/forks/PIDSMaker/postgres_tmpfs_run"
+LOG_DIR="/srv/lustre01/project/nlp_team-um6p-st-sccs-id7fz1zvotk/IDS/ahmed.bargady/forks/PIDSMaker/postgres_tmpfs_log"
 
 # Colors for output
 RED='\033[0;31m'
@@ -47,7 +47,7 @@ echo -e "${YELLOW}Creating directories...${NC}"
 mkdir -p $DATA_DIR $RUN_DIR $LOG_DIR
 
 # Create INPUT_DIR if it doesn't exist
-INPUT_DIR=${INPUT_DIR:-$(pwd)/data}
+INPUT_DIR=${INPUT_DIR:-/home/ahmed.bargady/lustre/nlp_team-um6p-st-sccs-id7fz1zvotk/IDS/ahmed.bargady/forks/PIDSMaker/data}
 if [ ! -d "$INPUT_DIR" ]; then
     echo -e "${YELLOW}Creating INPUT_DIR: $INPUT_DIR${NC}"
     mkdir -p "$INPUT_DIR"
@@ -67,12 +67,10 @@ if $CONTAINER_CMD instance list | grep -q "$POSTGRES_INSTANCE"; then
     fi
 fi
 
-# Check if any other postgres processes are running
-if pgrep -f "${CONTAINER_CMD}.*postgres" > /dev/null; then
-    echo -e "${YELLOW}Other PostgreSQL processes detected, cleaning up...${NC}"
-    pkill -f "${CONTAINER_CMD}.*postgres" || true
-    sleep 2
-fi
+# Avoid broad process cleanup here.
+# A pattern like "${CONTAINER_CMD}.*postgres" can match this script path
+# (scripts/apptainer/postgres-start.sh) and terminate the current job.
+# We only manage the explicit instance above (postgres_instance).
 
 # Set environment variables (works for both singularity and apptainer)
 if [ "$CONTAINER_CMD" = "apptainer" ]; then
