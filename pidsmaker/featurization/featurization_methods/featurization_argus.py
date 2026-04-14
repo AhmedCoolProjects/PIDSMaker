@@ -27,21 +27,70 @@ from pidsmaker.utils.utils import (
 
 def get_node2corpus(cfg, splits):
     indexid2msg = get_indexid2msg(cfg)
+    preview_one_sentence = os.environ.get("ARGUS_PREVIEW_ONE_SENTENCE", "0") == "1"
+    preview_random = os.environ.get("ARGUS_PREVIEW_RANDOM", "0") == "1"
+    preview_seed = int(os.environ.get("ARGUS_PREVIEW_SEED", "0"))
+    preview_skip_n = int(os.environ.get("ARGUS_PREVIEW_SKIP_N", "0"))
+    preview_take_n = int(os.environ.get("ARGUS_PREVIEW_TAKE_N", "1"))
+    preview_take_n = max(1, preview_take_n)
+    preview_rng = random.Random(preview_seed)
 
     def normalize_label_props(label: str) -> str:
-        parts = [part for part in label.split() if part]
+        parts = [part for part in str(label).split() if part]
         normalized = [part for part in parts if part != "None"]
         return " ".join(normalized)
 
-    def tokenize_flash_sentence(sentence: str):
-        # Keep path/netflow-like entities as single tokens by splitting only on whitespace.
-        # This avoids exploding sequence length when labels contain many '/' or '.' characters.
-        return [tok for tok in sentence.split() if tok]
+    entity_token_cache = {}
+
+    def get_indexid2msg_entry(node_id):
+        key_candidates = [node_id, str(node_id)]
+        try:
+            key_candidates.append(int(node_id))
+        except (ValueError, TypeError):
+            pass
+
+        for key in key_candidates:
+            if key in indexid2msg:
+                return indexid2msg[key]
+
+        return None
+
+    def get_entity_tokens(node_id, graph):
+        if node_id in entity_token_cache:
+            return entity_token_cache[node_id]
+
+        node_type = None
+        node_msg = None
+
+        if node_id in graph.nodes:
+            node_attrs = graph.nodes[node_id]
+            node_type = node_attrs.get("node_type")
+            node_msg = node_attrs.get("label")
+
+        if node_type is None:
+            entry = get_indexid2msg_entry(node_id)
+            if entry is not None:
+                node_type, node_msg = entry
+
+        if node_type is not None:
+            display_type = "process" if node_type == "subject" else node_type
+            clean_props = normalize_label_props(node_msg)
+            if clean_props:
+                tokens = [display_type] + clean_props.split()
+            else:
+                tokens = [display_type]
+        else:
+            tokens = [f"unknown_node_{node_id}"]
+
+        entity_token_cache[node_id] = tokens
+        return tokens
 
     split_to_paths = get_split_to_graph_paths(cfg, splits)
     sorted_paths = list(chain.from_iterable(split_to_paths.values()))
 
-    data_of_graphs = []
+    node2corpus = defaultdict(list)
+    preview_seen = 0
+    preview_samples = []
 
     for file_path in log_tqdm(sorted_paths, desc=f"Loading training data for {str(splits)}"):
         graph = torch.load(file_path)
@@ -54,58 +103,147 @@ def get_node2corpus(cfg, splits):
             key=lambda x: x[3],
         )
 
-        nodes, node_types = defaultdict(list), {}
         node_neighbor_events = defaultdict(list)
         for e in sorted_edges:
             src, dst, operation, t = e
-            src_type, src_msg = indexid2msg[src]
-            dst_type, dst_msg = indexid2msg[dst]
-
-            node_types[src] = src_type
-            node_types[dst] = dst_type
-
-            # Keep 1-hop neighbor events for both directions and preserve time order.
-            node_neighbor_events[src].append((t, operation, dst_type, dst_msg))
-            node_neighbor_events[dst].append((t, operation, src_type, src_msg))
+            # Build a provenance walk around each pivot node with explicit direction tags.
+            # <OUT>: pivot node acted on the neighbor (src -> dst).
+            # <IN>: pivot node was acted upon by the neighbor (src -> dst, pivot is dst).
+            node_neighbor_events[src].append((t, "<OUT>", operation, dst))
+            node_neighbor_events[dst].append((t, "<IN>", operation, src))
 
         for node_id, events in node_neighbor_events.items():
             # Events are already in time order because we iterate over sorted_edges.
-            prefixed_neighbors = []
-            for _, edge_type, neighbor_type, neighbor_msg in events:
-                display_type = "process" if neighbor_type == "subject" else neighbor_type
-                clean_props = normalize_label_props(neighbor_msg)
-                item = (
-                    f"{edge_type} {display_type} {clean_props}"
-                    if clean_props
-                    else f"{edge_type} {display_type}"
+            walk_tokens = list(get_entity_tokens(node_id, graph))
+            limited_events = events[:300]
+            interaction2count = defaultdict(int)
+            for _, direction, syscall, neighbor_id in limited_events:
+                syscall = str(syscall)
+                interaction_key = (direction, syscall, neighbor_id)
+                interaction2count[interaction_key] += 1
+
+            total_events = len(limited_events)
+            unique_interactions = len(interaction2count)
+            avg_interaction_count = (
+                float(total_events) / float(unique_interactions) if unique_interactions > 0 else 0.0
+            )
+
+            for _, direction, syscall, neighbor_id in limited_events:
+                syscall = str(syscall)
+                walk_tokens.extend(
+                    [
+                        direction,
+                        syscall,
+                        *get_entity_tokens(neighbor_id, graph),
+                    ]
                 )
-                prefixed_neighbors.append(item)
-            # log(f"Node {node_id} neighbors (time-ordered): {prefixed_neighbors}")
-            nodes[node_id].extend(prefixed_neighbors[:300])
 
-        features, types, index_map = [], [], {}
-        for node_id, props in nodes.items():
-            features.append(props)
-            types.append(node_types[node_id])
-            index_map[node_id] = len(features) - 1
+            if preview_one_sentence:
+                if preview_random:
+                    preview_seen += 1
+                    if len(preview_samples) < preview_take_n:
+                        preview_samples.append(
+                            (
+                                node_id,
+                                walk_tokens,
+                                avg_interaction_count,
+                                total_events,
+                                unique_interactions,
+                            )
+                        )
+                    else:
+                        replace_idx = preview_rng.randint(0, preview_seen - 1)
+                        if replace_idx < preview_take_n:
+                            preview_samples[replace_idx] = (
+                                node_id,
+                                walk_tokens,
+                                avg_interaction_count,
+                                total_events,
+                                unique_interactions,
+                            )
+                    continue
 
-        data_of_graphs.append((features, types, list(index_map.keys())))
+                if preview_seen < preview_skip_n:
+                    preview_seen += 1
+                    continue
 
-    token_cache = {}
-    node2corpus = defaultdict(list)
-    for graphs in log_tqdm(data_of_graphs, desc="Tokenizing corpus"):
-        for msg, node_type, node_id in zip(graphs[0], graphs[1], graphs[2]):
-            sentence = " ".join(msg)
-            if sentence not in token_cache:
-                # log(f'Sentence: {sentence}') # VERY BAD
-                tokens = tokenize_flash_sentence(sentence)
-                # log(f"Tokens: {tokens}")
-                token_cache[sentence] = tokens
+                entry = get_indexid2msg_entry(node_id)
+                if entry is not None:
+                    node_type, _ = entry
+                    log(
+                        f"Node {node_id} ({node_type}) avg_interaction_count={avg_interaction_count:.3f} "
+                        f"(total_events={total_events}, unique_interactions={unique_interactions})"
+                    )
+                    log(f"Node {node_id} ({node_type}) provenance walk tokens: {walk_tokens}")
+                else:
+                    log(
+                        f"Node {node_id} avg_interaction_count={avg_interaction_count:.3f} "
+                        f"(total_events={total_events}, unique_interactions={unique_interactions})"
+                    )
+                    log(f"Node {node_id} provenance walk tokens: {walk_tokens}")
 
-            tokens = token_cache[sentence]
-            log(f"Node {node_id} ({node_type}) sentence: '{sentence}' -> tokens: {tokens}")
-            break
-            node2corpus[node_id].extend(tokens)
+                node2corpus[node_id].extend(walk_tokens)
+                preview_seen += 1
+
+                if len(node2corpus) >= preview_take_n:
+                    log(
+                        "ARGUS preview mode enabled (ARGUS_PREVIEW_ONE_SENTENCE=1): "
+                        f"returning {len(node2corpus)} sentence(s) after skipping {preview_skip_n}."
+                    )
+                    return node2corpus
+                continue
+
+            entry = get_indexid2msg_entry(node_id)
+            if entry is not None:
+                node_type, _ = entry
+                log(
+                    f"Node {node_id} ({node_type}) avg_interaction_count={avg_interaction_count:.3f} "
+                    f"(total_events={total_events}, unique_interactions={unique_interactions})"
+                )
+                log(f"Node {node_id} ({node_type}) provenance walk tokens: {walk_tokens}")
+            else:
+                log(
+                    f"Node {node_id} avg_interaction_count={avg_interaction_count:.3f} "
+                    f"(total_events={total_events}, unique_interactions={unique_interactions})"
+                )
+                log(f"Node {node_id} provenance walk tokens: {walk_tokens}")
+
+            node2corpus[node_id].extend(walk_tokens)
+
+    if preview_one_sentence and preview_random:
+        for (
+            sampled_node_id,
+            sampled_tokens,
+            avg_interaction_count,
+            total_events,
+            unique_interactions,
+        ) in preview_samples:
+
+            entry = get_indexid2msg_entry(sampled_node_id)
+            if entry is not None:
+                node_type, _ = entry
+                log(
+                    f"Node {sampled_node_id} ({node_type}) avg_interaction_count={avg_interaction_count:.3f} "
+                    f"(total_events={total_events}, unique_interactions={unique_interactions})"
+                )
+                log(
+                    f"Node {sampled_node_id} ({node_type}) provenance walk tokens: {sampled_tokens}"
+                )
+            else:
+                log(
+                    f"Node {sampled_node_id} avg_interaction_count={avg_interaction_count:.3f} "
+                    f"(total_events={total_events}, unique_interactions={unique_interactions})"
+                )
+                log(f"Node {sampled_node_id} provenance walk tokens: {sampled_tokens}")
+
+            node2corpus[sampled_node_id].extend(sampled_tokens)
+
+        log(
+            "ARGUS preview mode enabled (ARGUS_PREVIEW_ONE_SENTENCE=1, ARGUS_PREVIEW_RANDOM=1): "
+            f"returning {len(node2corpus)} random sentence(s), "
+            f"seed={preview_seed}."
+        )
+        return node2corpus
 
     return node2corpus
 
