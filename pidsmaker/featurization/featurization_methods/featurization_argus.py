@@ -103,6 +103,8 @@ def get_node2corpus(cfg, splits):
                 token_cache[sentence] = tokens
 
             tokens = token_cache[sentence]
+            log(f"Node {node_id} ({node_type}) sentence: '{sentence}' -> tokens: {tokens}")
+            break
             node2corpus[node_id].extend(tokens)
 
     return node2corpus
