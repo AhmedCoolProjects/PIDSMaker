@@ -35,7 +35,8 @@ def get_default_cfg(args):
     Inits the shared cfg object with default configurations.
     """
     cfg = CN()
-    cfg._artifact_dir = args.artifact_dir
+    cfg._artifact_dir = os.path.abspath(args.artifact_dir)
+    os.makedirs(cfg._artifact_dir, exist_ok=True)
 
     cfg._test_mode = args.test_mode
     cfg._debug = not args.wandb
@@ -147,7 +148,9 @@ def get_runtime_required_args(return_unknown_args=False, args=None):
     )
     parser.add_argument("--sweep_id", default="", help="ID of a wandb sweep for multi-agent runs")
     parser.add_argument(
-        "--artifact_dir", default="/home/artifacts/", help="Destination folder for generated files"
+        "--artifact_dir",
+        default=str(ROOT_PROJECT_PATH / "artifacts"),
+        help="Destination folder for generated files",
     )
     parser.add_argument(
         "--test_mode",

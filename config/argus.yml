@@ -10,12 +10,12 @@ construction:
     file: path
     netflow: remote_ip, remote_port
   multi_dataset: none
+
 transformation:
-  used_methods: none
+  used_methods: none          # preserve full causal graph (PROVES-E, PROVES-V)
 
 featurization:
-  emb_dim: 768
-  epochs: 10 # 300
+  emb_dim: 769 # ← 768 for CodeBERT + 1 value for avg interactions count
   training_split: train
   used_method: argus
   seed: 0
@@ -23,14 +23,15 @@ featurization:
     min_count: 1
     workers: 15
     adapt_codebert: False
-    target_loss: 0.02
+    target_loss: 0.01
     min_steps_before_stop: 0
     codebert_model_name: microsoft/codebert-base
     mlm_probability: 0.15
     mlm_batch_size: 8
     mlm_learning_rate: 0.00005
     max_length: 512
-    sample_fraction: 1.00 # 0.05
+    sample_fraction: 1.00
+
 feat_inference:
   to_remove: True
 
@@ -42,38 +43,47 @@ batching:
   global_batching:
     used_method: none
   intra_graph_batching:
-    used_methods: none
+    used_methods: edges        # ← enables streaming sub-windows (DETECT-T)
+    edges:
+      intra_graph_batch_size: 1024
   inter_graph_batching:
     used_method: none
+
 training:
   used_method: default
   seed: 0
   deterministic: False
-  num_epochs: 12
-  patience: 3
-  lr: 0.01
-  weight_decay: 0.0005
-  node_hid_dim: 30
-  node_out_dim: 3
+  num_epochs: 50               # ← more epochs, patience handles early stop
+  patience: 5
+  lr: 0.0001                   # ← 100x lower: 0.01 is way too aggressive for 768-dim
+  weight_decay: 0.0001
+  node_hid_dim: 128            # ← 768→128 is reasonable compression (not 768→30)
+  node_out_dim: 64             # ← richer output space than 3
   grad_accumulation: 1
   encoder:
-    dropout: 0.5
-    used_methods: sage
-    sage:
+    dropout: 0.3               # ← 0.5 is aggressive, 0.3 is standard
+    used_methods: gat
+    gat:
       activation: relu
+      num_heads: 8
+      concat: True
+      flow: source_to_target
       num_layers: 2
   decoder:
-    used_methods: predict_node_type
-    predict_node_type:
-      decoder: none
+    used_methods: predict_edge_type
+    predict_edge_type:
+      decoder: edge_mlp
+      edge_mlp:
+        architecture_str: linear(1.0) | relu
+        src_dst_projection_coef: 1
       balanced_loss: True
+      use_triplet_types: False
 
 evaluation:
   viz_malicious_nodes: False
   ground_truth_version: orthrus
-  best_model_selection: best_adp
-  used_method: node_evaluation
-  node_evaluation:
-    threshold_method: flash
-    use_dst_node_loss: True
-    use_kmeans: False
+  best_model_selection: best_adp    # ← ADP as primary metric (DETECT-E: efficacy)
+  used_method: edge_evaluation
+  edge_evaluation:
+    malicious_edge_selection: src_node
+    threshold_method: max_val_loss

@@ -422,9 +422,10 @@ DISABLE_TQDM = True
 def log_tqdm(iterator, desc="", logging=True, **kwargs):
     now = datetime.now()
     timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-    if DISABLE_TQDM and logging:
+    disable = kwargs.pop("disable", DISABLE_TQDM)
+    if disable and logging:
         log(f"{desc}...")
-    return tqdm(iterator, desc=f"{timestamp} - {desc}", disable=DISABLE_TQDM, **kwargs)
+    return tqdm(iterator, desc=f"{timestamp} - {desc}", disable=disable, **kwargs)
 
 
 def get_device(cfg):

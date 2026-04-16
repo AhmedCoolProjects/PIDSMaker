@@ -119,9 +119,9 @@ def load_all_datasets(cfg, device, only_keep=None):
         val_data = val_data[:only_keep]
         test_data = test_data[:only_keep]
 
-    full_data = get_full_data([train_data, val_data, test_data])
-
-    max_node = torch.cat([full_data.src, full_data.dst]).max().item() + 1
+    # Avoid concatenating all splits unless TGN-specific batching requires it:
+    # this can double peak RAM on large datasets.
+    max_node = get_max_node([train_data, val_data, test_data])
     print(f"Max node in {cfg.dataset.name}: {max_node}")
 
     graph_reindexer = GraphReindexer(
@@ -134,6 +134,10 @@ def load_all_datasets(cfg, device, only_keep=None):
     datasets = run_global_batching(train_data, val_data, test_data, cfg, device)
 
     # Intra graph batching (TGN 1024 batches, last neighbor loader)
+    uses_tgn_last_neighbor = "tgn_last_neighbor" in map(
+        lambda x: x.strip(), cfg.batching.intra_graph_batching.used_methods.split(",")
+    )
+    full_data = get_full_data([train_data, val_data, test_data]) if uses_tgn_last_neighbor else None
     datasets = run_intra_graph_batching(datasets, full_data, device, max_node, cfg, graph_reindexer)
 
     # Reindexing stuff (create node-level attributes)
@@ -220,6 +224,8 @@ def extract_msg_from_data(
         )
 
     edge_features = list(map(lambda x: x.strip(), cfg.batching.edge_features.split(",")))
+    use_tgn_memory = "tgn" in cfg.training.encoder.used_methods and cfg.training.encoder.tgn.use_memory
+    keep_msg_tensor = use_tgn_memory or ("msg" in edge_features)
     possible_triplets = get_possible_triplets(cfg) if "edge_type_triplet" in edge_features else None
 
     for g in data_set:
@@ -294,8 +300,11 @@ def extract_msg_from_data(
         g.node_type_src = fields["src_type"]
         g.node_type_dst = fields["dst_type"]
 
-        if "tgn" in cfg.training.encoder.used_methods and cfg.training.encoder.tgn.use_memory:
+        if keep_msg_tensor:
             g.msg = msg
+        elif hasattr(g, "msg"):
+            # `msg` can be very large (edge-level embeddings). Drop it when unused.
+            del g.msg
 
         # NOTE: do not add edge_index as it is already within `CollatableTemporalData`
         # g.edge_index = ...
@@ -355,6 +364,17 @@ def get_full_data(datasets):
 
     full_data = Data(**{k: torch.cat(v) for k, v in all_data.items()})
     return full_data
+
+
+def get_max_node(datasets):
+    max_node = -1
+    for dataset_group in datasets:
+        for dataset in dataset_group:
+            for data in dataset:
+                curr_max = torch.max(data.src.max(), data.dst.max()).item()
+                if curr_max > max_node:
+                    max_node = curr_max
+    return max_node + 1
 
 
 def custom_temporal_data_loader(data: CollatableTemporalData, batch_size: int, *args, **kwargs):
@@ -544,6 +564,13 @@ def run_intra_graph_batching(datasets, full_data, device, max_node, cfg, graph_r
                 # Use temporal batch loader used in TGN
                 if method == "edges":
                     batch_size = cfg.batching.intra_graph_batching.edges.intra_graph_batch_size
+                    if batch_size in [None, 0]:
+                        # Keep training resilient when config overlays forget this key.
+                        batch_size = 1024
+                        log(
+                            "Missing or invalid cfg.batching.intra_graph_batching.edges.intra_graph_batch_size; "
+                            f"defaulting to {batch_size}."
+                        )
                     batch_loader = custom_temporal_data_loader(batch, batch_size=batch_size)
                 elif method == "neighbor_sampling":
                     raise NotImplementedError
@@ -566,6 +593,10 @@ def run_intra_graph_batching(datasets, full_data, device, max_node, cfg, graph_r
             datasets = [standard_intra_batching(dataset, method) for dataset in datasets]
 
         elif method == "tgn_last_neighbor":
+            if full_data is None:
+                raise ValueError(
+                    "tgn_last_neighbor batching requires full_data, but it was not computed."
+                )
             tgn_loader_cfg = cfg.batching.intra_graph_batching.tgn_last_neighbor
             sample = datasets[0][0][0]
             datasets = compute_tgn_graphs(
@@ -914,4 +945,9 @@ def reindex_graphs(datasets, graph_reindexer, device, use_tgn, x_is_tuple=False)
             for batch in log_tqdm(data_list, desc="Reindexing graphs"):
                 batch.to(device)
                 graph_reindexer.reindex_graph(batch, use_tgn=use_tgn, x_is_tuple=x_is_tuple)
+                if not use_tgn:
+                    # These edge-level tensors are no longer required once `x`/`node_type` are built.
+                    for attr in ["x_src", "x_dst", "node_type_src", "node_type_dst", "msg"]:
+                        if hasattr(batch, attr):
+                            delattr(batch, attr)
                 batch.to("cpu")

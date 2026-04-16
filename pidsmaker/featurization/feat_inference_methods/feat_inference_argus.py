@@ -9,7 +9,7 @@ from pidsmaker.featurization.featurization_methods.featurization_argus import ge
 from pidsmaker.utils.utils import log, log_start, log_tqdm
 
 
-def infer(document, encoder_model, tokenizer, max_length, device, output_dim):
+def infer(document, encoder_model, tokenizer, max_length, device, output_dim, avg_interaction_count=0.0):
     """Infer a single ARGUS node embedding from tokenized neighborhood text."""
     if not document:
         return np.zeros(output_dim)
@@ -30,6 +30,9 @@ def infer(document, encoder_model, tokenizer, max_length, device, output_dim):
         pooled = (hidden * mask).sum(dim=0) / mask.sum(dim=0).clamp(min=1.0)
 
     vector = pooled.detach().cpu().numpy()
+    vector = np.concatenate(
+        [vector, np.array([float(avg_interaction_count)], dtype=vector.dtype)], axis=0
+    )
     if len(vector) > output_dim:
         return vector[:output_dim]
     if len(vector) < output_dim:
@@ -98,13 +101,19 @@ def main(cfg):
     output_dim = int(cfg.featurization.emb_dim)
 
     hidden_size = int(encoder_model.config.hidden_size)
-    if hidden_size != output_dim:
+    expected_size_with_avg = hidden_size + 1
+    if expected_size_with_avg != output_dim:
         log(
-            f"Warning: CodeBERT hidden size ({hidden_size}) differs from emb_dim ({output_dim}). "
+            "Warning: CodeBERT + avg interaction feature size "
+            f"({hidden_size} + 1 = {expected_size_with_avg}) differs from emb_dim ({output_dim}). "
             "Vectors will be truncated/padded to match emb_dim."
         )
 
-    node2corpus = get_node2corpus(cfg, splits=["train", "val", "test"])
+    node2corpus, node2avg_interaction_count = get_node2corpus(
+        cfg,
+        splits=["train", "val", "test"],
+        return_avg_interaction_count=True,
+    )
     log(f"Embedding {len(node2corpus)} nodes with ARGUS...")
     indexid2vec = {}
     total_nodes = len(node2corpus)
@@ -112,7 +121,9 @@ def main(cfg):
         node2corpus.items(),
         desc="Embedding all nodes in the dataset",
         total=total_nodes,
+        disable=False,
     ):
+        avg_interaction_count = float(node2avg_interaction_count.get(indexid, 0.0))
         indexid2vec[indexid] = infer(
             corpus,
             encoder_model,
@@ -120,6 +131,7 @@ def main(cfg):
             max_length=max_length,
             device=device,
             output_dim=output_dim,
+            avg_interaction_count=avg_interaction_count,
         )
 
     return indexid2vec

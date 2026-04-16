@@ -25,7 +25,7 @@ from pidsmaker.utils.utils import (
 )
 
 
-def get_node2corpus(cfg, splits):
+def get_node2corpus(cfg, splits, return_avg_interaction_count=False):
     indexid2msg = get_indexid2msg(cfg)
     preview_one_sentence = os.environ.get("ARGUS_PREVIEW_ONE_SENTENCE", "0") == "1"
     preview_random = os.environ.get("ARGUS_PREVIEW_RANDOM", "0") == "1"
@@ -85,10 +85,28 @@ def get_node2corpus(cfg, splits):
         entity_token_cache[node_id] = tokens
         return tokens
 
+    def log_node_summary(node_id, walk_tokens, avg_interaction_count, total_events, unique_interactions):
+        return
+        entry = get_indexid2msg_entry(node_id)
+        if entry is not None:
+            node_type, _ = entry
+            log(
+                f"Node {node_id} ({node_type}) avg_interaction_count={avg_interaction_count:.3f} "
+                f"(total_events={total_events}, unique_interactions={unique_interactions})"
+            )
+            log(f"Node {node_id} ({node_type}) provenance walk tokens: {walk_tokens}")
+        else:
+            log(
+                f"Node {node_id} avg_interaction_count={avg_interaction_count:.3f} "
+                f"(total_events={total_events}, unique_interactions={unique_interactions})"
+            )
+            log(f"Node {node_id} provenance walk tokens: {walk_tokens}")
+
     split_to_paths = get_split_to_graph_paths(cfg, splits)
     sorted_paths = list(chain.from_iterable(split_to_paths.values()))
 
     node2corpus = defaultdict(list)
+    node2avg_interaction_count = {}
     preview_seen = 0
     preview_samples = []
 
@@ -167,22 +185,16 @@ def get_node2corpus(cfg, splits):
                     preview_seen += 1
                     continue
 
-                entry = get_indexid2msg_entry(node_id)
-                if entry is not None:
-                    node_type, _ = entry
-                    log(
-                        f"Node {node_id} ({node_type}) avg_interaction_count={avg_interaction_count:.3f} "
-                        f"(total_events={total_events}, unique_interactions={unique_interactions})"
-                    )
-                    log(f"Node {node_id} ({node_type}) provenance walk tokens: {walk_tokens}")
-                else:
-                    log(
-                        f"Node {node_id} avg_interaction_count={avg_interaction_count:.3f} "
-                        f"(total_events={total_events}, unique_interactions={unique_interactions})"
-                    )
-                    log(f"Node {node_id} provenance walk tokens: {walk_tokens}")
+                log_node_summary(
+                    node_id,
+                    walk_tokens,
+                    avg_interaction_count,
+                    total_events,
+                    unique_interactions,
+                )
 
                 node2corpus[node_id].extend(walk_tokens)
+                node2avg_interaction_count[node_id] = avg_interaction_count
                 preview_seen += 1
 
                 if len(node2corpus) >= preview_take_n:
@@ -190,25 +202,21 @@ def get_node2corpus(cfg, splits):
                         "ARGUS preview mode enabled (ARGUS_PREVIEW_ONE_SENTENCE=1): "
                         f"returning {len(node2corpus)} sentence(s) after skipping {preview_skip_n}."
                     )
+                    if return_avg_interaction_count:
+                        return node2corpus, node2avg_interaction_count
                     return node2corpus
                 continue
 
-            entry = get_indexid2msg_entry(node_id)
-            if entry is not None:
-                node_type, _ = entry
-                log(
-                    f"Node {node_id} ({node_type}) avg_interaction_count={avg_interaction_count:.3f} "
-                    f"(total_events={total_events}, unique_interactions={unique_interactions})"
-                )
-                log(f"Node {node_id} ({node_type}) provenance walk tokens: {walk_tokens}")
-            else:
-                log(
-                    f"Node {node_id} avg_interaction_count={avg_interaction_count:.3f} "
-                    f"(total_events={total_events}, unique_interactions={unique_interactions})"
-                )
-                log(f"Node {node_id} provenance walk tokens: {walk_tokens}")
+            log_node_summary(
+                node_id,
+                walk_tokens,
+                avg_interaction_count,
+                total_events,
+                unique_interactions,
+            )
 
             node2corpus[node_id].extend(walk_tokens)
+            node2avg_interaction_count[node_id] = avg_interaction_count
 
     if preview_one_sentence and preview_random:
         for (
@@ -219,32 +227,28 @@ def get_node2corpus(cfg, splits):
             unique_interactions,
         ) in preview_samples:
 
-            entry = get_indexid2msg_entry(sampled_node_id)
-            if entry is not None:
-                node_type, _ = entry
-                log(
-                    f"Node {sampled_node_id} ({node_type}) avg_interaction_count={avg_interaction_count:.3f} "
-                    f"(total_events={total_events}, unique_interactions={unique_interactions})"
-                )
-                log(
-                    f"Node {sampled_node_id} ({node_type}) provenance walk tokens: {sampled_tokens}"
-                )
-            else:
-                log(
-                    f"Node {sampled_node_id} avg_interaction_count={avg_interaction_count:.3f} "
-                    f"(total_events={total_events}, unique_interactions={unique_interactions})"
-                )
-                log(f"Node {sampled_node_id} provenance walk tokens: {sampled_tokens}")
+            log_node_summary(
+                sampled_node_id,
+                sampled_tokens,
+                avg_interaction_count,
+                total_events,
+                unique_interactions,
+            )
 
             node2corpus[sampled_node_id].extend(sampled_tokens)
+            node2avg_interaction_count[sampled_node_id] = avg_interaction_count
 
         log(
             "ARGUS preview mode enabled (ARGUS_PREVIEW_ONE_SENTENCE=1, ARGUS_PREVIEW_RANDOM=1): "
             f"returning {len(node2corpus)} random sentence(s), "
             f"seed={preview_seed}."
         )
+        if return_avg_interaction_count:
+            return node2corpus, node2avg_interaction_count
         return node2corpus
 
+    if return_avg_interaction_count:
+        return node2corpus, node2avg_interaction_count
     return node2corpus
 
 
@@ -293,15 +297,6 @@ def get_split_to_graph_paths(cfg, splits):
     return split_to_paths
 
 
-class RepeatableIterator:
-    def __init__(self, data):
-        self.data = data
-
-    def __iter__(self):
-        for phrase in self.data:
-            yield phrase
-
-
 class ArgusMLMDataset(Dataset):
     def __init__(self, encodings):
         self.encodings = encodings
@@ -341,7 +336,18 @@ def main(cfg):
 
     argus_cfg = cfg.featurization.argus
     adapt_codebert = bool(getattr(argus_cfg, "adapt_codebert", True))
-    epochs = cfg.featurization.epochs
+    epochs = getattr(cfg.featurization, "epochs", None)
+    if epochs is None:
+        epochs = int(getattr(argus_cfg, "epochs", 1))
+        log(
+            "featurization.epochs is not set; defaulting MLM adaptation epochs "
+            f"to {epochs}."
+        )
+    epochs = int(epochs)
+    if epochs <= 0:
+        raise ValueError(
+            f"Invalid featurization.epochs={epochs}. Expected a positive integer for MLM adaptation."
+        )
     workers = argus_cfg.workers
     model_name = getattr(argus_cfg, "codebert_model_name", "microsoft/codebert-base")
     max_length = int(getattr(argus_cfg, "max_length", 512))

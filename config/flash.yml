@@ -14,7 +14,7 @@ transformation:
   used_methods: none
 
 featurization:
-  emb_dim: 30
+  emb_dim: 768
   epochs: 10 # 300
   training_split: train
   used_method: flash
@@ -22,6 +22,15 @@ featurization:
   flash:
     min_count: 1
     workers: 15
+    adapt_codebert: False
+    target_loss: 0.02
+    min_steps_before_stop: 0
+    codebert_model_name: microsoft/codebert-base
+    mlm_probability: 0.15
+    mlm_batch_size: 8
+    mlm_learning_rate: 0.00005
+    max_length: 512
+    sample_fraction: 1.00 # 0.05
 feat_inference:
   to_remove: True
 

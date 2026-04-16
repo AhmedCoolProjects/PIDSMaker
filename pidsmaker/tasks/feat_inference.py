@@ -5,12 +5,19 @@ import torch
 from pidsmaker.config import update_cfg_for_multi_dataset
 from pidsmaker.featurization.feat_inference_methods import (
     feat_inference_alacarte,
+    feat_inference_argus,
     feat_inference_doc2vec,
     feat_inference_fasttext,
     feat_inference_flash,
     feat_inference_HFH,
     feat_inference_TRW,
     feat_inference_word2vec,
+)
+from pidsmaker.featurization.featurization_methods.featurization_argus import (
+    get_split_to_graph_paths as get_argus_split_to_graph_paths,
+)
+from pidsmaker.featurization.featurization_methods.featurization_flash import (
+    get_split_to_graph_paths as get_flash_split_to_graph_paths,
 )
 from pidsmaker.utils.data_utils import CollatableTemporalData
 from pidsmaker.utils.dataset_utils import get_node_map, get_rel2id
@@ -96,6 +103,8 @@ def get_indexid2vec(cfg):
         return feat_inference_TRW.main(cfg)
     if method == "flash":
         return feat_inference_flash.main(cfg)
+    if method == "argus":
+        return feat_inference_argus.main(cfg)
     if method == "fasttext":
         return feat_inference_fasttext.main(cfg)
 
@@ -110,6 +119,16 @@ def main_from_config(cfg):
 
     base_dir = cfg.transformation._graphs_dir
     split_to_files = get_split_to_files(cfg, base_dir)
+
+    method = cfg.featurization.used_method.strip()
+    if method == "flash":
+        sample_fraction = float(getattr(cfg.featurization.flash, "sample_fraction", 1.0))
+        if sample_fraction < 1.0:
+            split_to_files = get_flash_split_to_graph_paths(cfg, list(split_to_files.keys()))
+    if method == "argus":
+        sample_fraction = float(getattr(cfg.featurization.argus, "sample_fraction", 1.0))
+        if sample_fraction < 1.0:
+            split_to_files = get_argus_split_to_graph_paths(cfg, list(split_to_files.keys()))
 
     # Here we get a mapping {node_id => embedding vector}
     indexid2vec = get_indexid2vec(cfg)

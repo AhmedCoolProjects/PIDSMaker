@@ -437,16 +437,29 @@ def objective_factory(cfg, in_dim, graph_reindexer, device, objective_cfg=None):
         elif objective == "predict_node_type":
             loss_fn = categorical_loss_fn_factory("cross_entropy")
             balanced_loss = objective_cfg.predict_node_type.balanced_loss
+            num_node_types = cfg.dataset.num_node_types
+
+            if method == "none" and node_out_dim != num_node_types:
+                raise ValueError(
+                    "Invalid configuration for predict_node_type: decoder='none' requires "
+                    f"training.node_out_dim ({node_out_dim}) to match dataset.num_node_types "
+                    f"({num_node_types}). Use decoder='node_mlp' to project dimensions."
+                )
 
             decoder = decoder_factory(
-                method, objective, cfg, in_dim=node_out_dim, out_dim=node_out_dim, device=device
+                method,
+                objective,
+                cfg,
+                in_dim=node_out_dim,
+                out_dim=num_node_types,
+                device=device,
             )
             objectives.append(
                 NodeTypePrediction(
                     decoder=decoder,
                     loss_fn=loss_fn,
                     balanced_loss=balanced_loss,
-                    node_type_dim=cfg.dataset.num_node_types,
+                    node_type_dim=num_node_types,
                 )
             )
 

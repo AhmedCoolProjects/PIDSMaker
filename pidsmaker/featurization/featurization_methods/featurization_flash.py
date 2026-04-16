@@ -1,9 +1,19 @@
 import os
+import random
+import warnings
 from collections import defaultdict
 from itertools import chain
 
 import torch
-from gensim.models import Word2Vec
+from torch.utils.data import Dataset
+from transformers import (
+    AutoModelForMaskedLM,
+    AutoTokenizer,
+    DataCollatorForLanguageModeling,
+    Trainer,
+    TrainerCallback,
+    TrainingArguments,
+)
 
 from pidsmaker.featurization.featurization_utils import get_splits_to_train_featurization
 from pidsmaker.utils.utils import (
@@ -12,15 +22,24 @@ from pidsmaker.utils.utils import (
     log,
     log_start,
     log_tqdm,
-    tokenize_arbitrary_label,
 )
 
 
 def get_node2corpus(cfg, splits):
     indexid2msg = get_indexid2msg(cfg)
 
-    dates = list(chain.from_iterable([getattr(cfg.dataset, f"{split}_dates") for split in splits]))
-    sorted_paths = get_all_graphs_for_dates(cfg.transformation._graphs_dir, dates)
+    def normalize_label_props(label: str) -> str:
+        parts = [part for part in label.split() if part]
+        normalized = [part for part in parts if part != "None"]
+        return " ".join(normalized)
+
+    def tokenize_flash_sentence(sentence: str):
+        # Keep path/netflow-like entities as single tokens by splitting only on whitespace.
+        # This avoids exploding sequence length when labels contain many '/' or '.' characters.
+        return [tok for tok in sentence.split() if tok]
+
+    split_to_paths = get_split_to_graph_paths(cfg, splits)
+    sorted_paths = list(chain.from_iterable(split_to_paths.values()))
 
     data_of_graphs = []
 
@@ -35,23 +54,34 @@ def get_node2corpus(cfg, splits):
             key=lambda x: x[3],
         )
 
-        nodes, node_types, edges = defaultdict(list), {}, []
+        nodes, node_types = defaultdict(list), {}
+        node_neighbor_events = defaultdict(list)
         for e in sorted_edges:
             src, dst, operation, t = e
             src_type, src_msg = indexid2msg[src]
             dst_type, dst_msg = indexid2msg[dst]
 
-            properties = [src_msg, operation, dst_msg]
-
-            if len(nodes[src]) < 300:
-                nodes[src].extend(properties)
             node_types[src] = src_type
-
-            if len(nodes[dst]) < 300:
-                nodes[dst].extend(properties)
             node_types[dst] = dst_type
 
-            edges.append((src, dst))
+            # Keep 1-hop neighbor events for both directions and preserve time order.
+            node_neighbor_events[src].append((t, operation, dst_type, dst_msg))
+            node_neighbor_events[dst].append((t, operation, src_type, src_msg))
+
+        for node_id, events in node_neighbor_events.items():
+            # Events are already in time order because we iterate over sorted_edges.
+            prefixed_neighbors = []
+            for _, edge_type, neighbor_type, neighbor_msg in events:
+                display_type = "process" if neighbor_type == "subject" else neighbor_type
+                clean_props = normalize_label_props(neighbor_msg)
+                item = (
+                    f"{edge_type} {display_type} {clean_props}"
+                    if clean_props
+                    else f"{edge_type} {display_type}"
+                )
+                prefixed_neighbors.append(item)
+            # log(f"Node {node_id} neighbors (time-ordered): {prefixed_neighbors}")
+            nodes[node_id].extend(prefixed_neighbors[:300])
 
         features, types, index_map = [], [], {}
         for node_id, props in nodes.items():
@@ -65,15 +95,62 @@ def get_node2corpus(cfg, splits):
     node2corpus = defaultdict(list)
     for graphs in log_tqdm(data_of_graphs, desc="Tokenizing corpus"):
         for msg, node_type, node_id in zip(graphs[0], graphs[1], graphs[2]):
-            for sentence in msg:
-                if sentence not in token_cache:
-                    tokens = tokenize_arbitrary_label(sentence)
-                    token_cache[sentence] = tokens
+            sentence = " ".join(msg)
+            if sentence not in token_cache:
+                # log(f'Sentence: {sentence}') # VERY BAD
+                tokens = tokenize_flash_sentence(sentence)
+                # log(f"Tokens: {tokens}")
+                token_cache[sentence] = tokens
 
-                tokens = token_cache[sentence]
-                node2corpus[node_id].extend(tokens)
+            tokens = token_cache[sentence]
+            node2corpus[node_id].extend(tokens)
 
     return node2corpus
+
+
+def _sample_dates_for_split(dates, sample_fraction, seed):
+    if sample_fraction >= 1.0:
+        return list(dates)
+
+    if sample_fraction <= 0.0:
+        return []
+
+    if len(dates) == 0:
+        return []
+
+    sample_size = max(1, int(len(dates) * sample_fraction))
+    sample_size = min(sample_size, len(dates))
+    rng = random.Random(seed)
+    return sorted(rng.sample(list(dates), sample_size))
+
+
+def get_split_to_graph_paths(cfg, splits):
+    flash_cfg = cfg.featurization.flash
+    sample_fraction = float(getattr(flash_cfg, "sample_fraction", 1.0))
+    if not 0.0 < sample_fraction <= 1.0:
+        raise ValueError(
+            f"Invalid flash.sample_fraction={sample_fraction}. Expected value in (0, 1]."
+        )
+
+    base_seed = int(getattr(cfg.featurization, "seed", 0))
+    split_to_paths = {}
+    for split in splits:
+        split_dates = list(getattr(cfg.dataset, f"{split}_dates"))
+        split_seed = base_seed + sum(ord(ch) for ch in split)
+        sampled_dates = _sample_dates_for_split(split_dates, sample_fraction, split_seed)
+        if sample_fraction < 1.0:
+            log(
+                f"FLASH sampling for split='{split}': "
+                f"{len(sampled_dates)}/{len(split_dates)} dates "
+                f"(fraction={sample_fraction:.3f})."
+            )
+
+        split_to_paths[split] = get_all_graphs_for_dates(
+            cfg.transformation._graphs_dir,
+            sampled_dates,
+        )
+
+    return split_to_paths
 
 
 class RepeatableIterator:
@@ -81,27 +158,145 @@ class RepeatableIterator:
         self.data = data
 
     def __iter__(self):
-        for phrases in self.data:
-            for sentence in phrases:
-                yield sentence
+        for phrase in self.data:
+            yield phrase
+
+
+class FlashMLMDataset(Dataset):
+    def __init__(self, encodings):
+        self.encodings = encodings
+
+    def __len__(self):
+        return len(self.encodings["input_ids"])
+
+    def __getitem__(self, idx):
+        return {k: torch.tensor(v[idx]) for k, v in self.encodings.items()}
+
+
+class StopOnLossCallback(TrainerCallback):
+    def __init__(self, target_loss: float, min_steps_before_stop: int = 0):
+        self.target_loss = target_loss
+        self.min_steps_before_stop = min_steps_before_stop
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs or "loss" not in logs:
+            return control
+
+        if state.global_step < self.min_steps_before_stop:
+            return control
+
+        current_loss = float(logs["loss"])
+        if current_loss <= self.target_loss:
+            log(
+                f"Stopping MLM adaptation early at step={state.global_step}, "
+                f"epoch={state.epoch:.2f}, loss={current_loss:.4f} "
+                f"(target={self.target_loss:.4f})."
+            )
+            control.should_training_stop = True
+        return control
 
 
 def main(cfg):
     log_start(__file__)
 
-    training_files = get_splits_to_train_featurization(cfg)
-    all_phrases = list(get_node2corpus(cfg=cfg, splits=training_files).values())
-
-    emb_dim = cfg.featurization.emb_dim
+    flash_cfg = cfg.featurization.flash
+    adapt_codebert = bool(getattr(flash_cfg, "adapt_codebert", True))
     epochs = cfg.featurization.epochs
-    min_count = cfg.featurization.flash.min_count
-    workers = cfg.featurization.flash.workers
-
-    log("Training word2vec model...")
-    model = Word2Vec(vector_size=emb_dim, min_count=min_count, workers=workers, epochs=epochs)
-    model.build_vocab(RepeatableIterator(all_phrases), progress_per=10000)
-    model.train(RepeatableIterator(all_phrases), total_examples=model.corpus_count, epochs=epochs)
+    workers = flash_cfg.workers
+    model_name = getattr(flash_cfg, "codebert_model_name", "microsoft/codebert-base")
+    max_length = int(getattr(flash_cfg, "max_length", 512))
+    mlm_probability = float(getattr(flash_cfg, "mlm_probability", 0.15))
+    batch_size = int(getattr(flash_cfg, "mlm_batch_size", 8))
+    learning_rate = float(getattr(flash_cfg, "mlm_learning_rate", 5e-5))
+    target_loss = getattr(flash_cfg, "target_loss", None)
+    min_steps_before_stop = int(getattr(flash_cfg, "min_steps_before_stop", 0))
 
     model_save_dir = cfg.featurization._model_dir
     os.makedirs(model_save_dir, exist_ok=True)
-    model.save(os.path.join(model_save_dir, "word2vec_model_final.model"))
+
+    log(
+        f"FLASH mode: adapt_codebert={adapt_codebert}, "
+        f"model={model_name}, mlm_learning_rate={learning_rate}"
+    )
+
+    if not adapt_codebert:
+        log(
+            "Skipping CodeBERT domain adaptation (flash.adapt_codebert=False). "
+            f"Feat inference will load base model: {model_name}."
+        )
+        return
+
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+    warnings.filterwarnings(
+        "ignore",
+        message="`resume_download` is deprecated",
+        category=FutureWarning,
+    )
+
+    training_files = get_splits_to_train_featurization(cfg)
+    node2corpus = get_node2corpus(cfg=cfg, splits=training_files)
+    all_phrases = list(node2corpus.values())
+    log(f"Total nodes to featurize: {len(all_phrases)}")
+
+    sentences = [" ".join(tokens) for tokens in all_phrases if len(tokens) > 0]
+    if len(sentences) == 0:
+        raise ValueError("Flash corpus is empty. Cannot adapt CodeBERT without training sentences.")
+
+    log(f"Loading CodeBERT tokenizer/model from {model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    model = AutoModelForMaskedLM.from_pretrained(model_name)
+
+    encodings = tokenizer(
+        sentences,
+        truncation=True,
+        max_length=max_length,
+        padding=False,
+        return_special_tokens_mask=True,
+    )
+    train_dataset = FlashMLMDataset(encodings)
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=True,
+        mlm_probability=mlm_probability,
+    )
+
+    log("Running CodeBERT domain adaptation with MLM...")
+    mlm_tmp_dir = os.path.join(model_save_dir, "codebert_mlm_tmp")
+
+    training_args = TrainingArguments(
+        output_dir=mlm_tmp_dir,
+        overwrite_output_dir=True,
+        num_train_epochs=epochs,
+        per_device_train_batch_size=batch_size,
+        learning_rate=learning_rate,
+        dataloader_num_workers=workers,
+        optim="adamw_torch",
+        save_strategy="no",
+        report_to=[],
+        logging_steps=200,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        data_collator=data_collator,
+        tokenizer=tokenizer,
+    )
+
+    if target_loss is not None:
+        target_loss = float(target_loss)
+        if target_loss > 0:
+            trainer.add_callback(StopOnLossCallback(target_loss, min_steps_before_stop))
+            log(
+                f"Enabled early stop for MLM adaptation at loss <= {target_loss:.4f} "
+                f"(min_steps_before_stop={min_steps_before_stop})."
+            )
+
+    trainer.train()
+
+    final_model_dir = os.path.join(model_save_dir, "codebert_mlm_final")
+    model.save_pretrained(final_model_dir)
+    tokenizer.save_pretrained(final_model_dir)
+    log(f"Adapted CodeBERT model saved to {final_model_dir}")

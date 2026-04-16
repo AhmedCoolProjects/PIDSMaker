@@ -1,6 +1,7 @@
 from pidsmaker.featurization.featurization_methods import (
     build_trw,
     featurization_alacarte,
+    featurization_argus,
     featurization_doc2vec,
     featurization_fasttext,
     featurization_flash,
@@ -31,6 +32,8 @@ def main(cfg):
         featurization_trw.main(cfg)
     elif method == "flash":
         featurization_flash.main(cfg)
+    elif method == "argus":
+        featurization_argus.main(cfg)
     elif method == "fasttext":
         featurization_fasttext.main(cfg)
     else:
