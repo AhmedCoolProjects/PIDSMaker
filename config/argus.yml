@@ -31,6 +31,9 @@ featurization:
     mlm_learning_rate: 0.00005
     max_length: 512
     sample_fraction: 1.00
+    projection_train_epochs: 3
+    projection_batch_size: 512
+    projection_learning_rate: 0.001
 
 feat_inference:
   to_remove: True
