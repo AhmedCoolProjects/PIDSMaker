@@ -256,24 +256,24 @@ def main(cfg):
             split="test",
         )
 
-    wandb.log(
-        {
-            "best_epoch": best_epoch,
-            "train_epoch_time": round(np.mean(epoch_times), 2),
-            "val_score": round(best_val_score, 5),
-            "peak_train_cpu_memory": round(peak_train_cpu_mem, 3),
-            "peak_train_gpu_memory": round(peak_train_gpu_mem, 3),
-            "peak_inference_cpu_memory": round(
-                np.max([d["peak_inference_cpu_memory"] for d in all_test_stats]), 3
-            ),
-            "peak_inference_gpu_memory": round(
-                np.max([d["peak_inference_gpu_memory"] for d in all_test_stats]), 3
-            ),
-            "time_per_batch_inference": round(
-                np.mean([d["time_per_batch_inference"] for d in all_test_stats]), 3
-            ),
-        }
-    )
+    train_log = {
+        "best_epoch": best_epoch,
+        "train_epoch_time": round(np.mean(epoch_times), 2) if epoch_times else 0,
+        "val_score": round(best_val_score, 5),
+        "peak_train_cpu_memory": round(peak_train_cpu_mem, 3),
+        "peak_train_gpu_memory": round(peak_train_gpu_mem, 3),
+    }
+    if all_test_stats:
+        train_log["peak_inference_cpu_memory"] = round(
+            np.max([d["peak_inference_cpu_memory"] for d in all_test_stats]), 3
+        )
+        train_log["peak_inference_gpu_memory"] = round(
+            np.max([d["peak_inference_gpu_memory"] for d in all_test_stats]), 3
+        )
+        train_log["time_per_batch_inference"] = round(
+            np.mean([d["time_per_batch_inference"] for d in all_test_stats]), 3
+        )
+    wandb.log(train_log)
 
     return best_val_score
 

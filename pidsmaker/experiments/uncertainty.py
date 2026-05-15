@@ -134,7 +134,7 @@ def fuse_hyperparameter_metrics(method_to_metrics):
         if include_metric_in_stats(val):
             all_values = []
             for param, list_of_dict in method_to_metrics.items():
-                values = [d[metric] for d in list_of_dict if "precision" in d]
+                values = [d[metric] for d in list_of_dict if metric in d]
                 all_values.append(values)
             mean_metrics[metric] = np.mean(all_values, axis=0)
 
@@ -147,43 +147,53 @@ def fuse_hyperparameter_metrics(method_to_metrics):
 def avg_std_metrics(method_to_metrics):
     metrics = fuse_hyperparameter_metrics(method_to_metrics)
 
+    all_keys = {k for m in metrics for k in m if include_metric_in_stats(m.get(k))}
     result = {}
-    metric_keys = metrics[0].keys()
-    for key in metric_keys:
-        values = [entry[key] for entry in metrics]
-        result[f"{key}_mean"] = np.mean(values)
-        result[f"{key}_std"] = np.std(values)
-        result[f"{key}_std_rel"] = np.std(values) / (np.mean(values) + 1e-12) * 100
+    for key in all_keys:
+        values = [entry.get(key, np.nan) for entry in metrics]
+        mean = np.nanmean(values)
+        std = np.nanstd(values)
+        result[f"{key}_mean"] = mean
+        result[f"{key}_std"] = std
+        result[f"{key}_std_rel"] = std / (abs(mean) + 1e-12) * 100
 
     return result
 
 
-def max_metrics(method_to_metrics, metric="adp_score"):
+def best_adp_metrics(method_to_metrics, metric="adp_score"):
+    """Snapshot of all metrics from the iteration with the highest adp_score."""
     metrics = method_to_metrics[list(method_to_metrics.keys())[0]]
-    max_idx = np.argmax([m[metric] for m in metrics])
-
-    result = {}
-    metric_keys = metrics[0].keys()
-    for key in metric_keys:
-        value = metrics[max_idx][key]
-        if include_metric_in_stats(value):
-            result[f"{key}_max"] = value
-
-    return result
+    max_idx = np.argmax([m.get(metric, float("-inf")) for m in metrics])
+    return {
+        f"{k}_at_best_adp": v
+        for k, v in metrics[max_idx].items()
+        if include_metric_in_stats(v)
+    }
 
 
-def min_metrics(method_to_metrics, metric="adp_score"):
+def worst_adp_metrics(method_to_metrics, metric="adp_score"):
+    """Snapshot of all metrics from the iteration with the lowest adp_score."""
     metrics = method_to_metrics[list(method_to_metrics.keys())[0]]
-    min_idx = np.argmin([m[metric] for m in metrics])
+    min_idx = np.argmin([m.get(metric, float("inf")) for m in metrics])
+    return {
+        f"{k}_at_worst_adp": v
+        for k, v in metrics[min_idx].items()
+        if include_metric_in_stats(v)
+    }
 
-    result = {}
-    metric_keys = metrics[0].keys()
-    for key in metric_keys:
-        value = metrics[min_idx][key]
-        if include_metric_in_stats(value):
-            result[f"{key}_min"] = value
 
-    return result
+def true_max_metrics(method_to_metrics):
+    """Per-metric maximum across all iterations."""
+    metrics = method_to_metrics[list(method_to_metrics.keys())[0]]
+    all_keys = {k for m in metrics for k in m if include_metric_in_stats(m[k])}
+    return {f"{k}_max": np.nanmax([m.get(k, np.nan) for m in metrics]) for k in all_keys}
+
+
+def true_min_metrics(method_to_metrics):
+    """Per-metric minimum across all iterations."""
+    metrics = method_to_metrics[list(method_to_metrics.keys())[0]]
+    all_keys = {k for m in metrics for k in m if include_metric_in_stats(m[k])}
+    return {f"{k}_min": np.nanmin([m.get(k, np.nan) for m in metrics]) for k in all_keys}
 
 
 def push_best_files_to_wandb(method_to_metrics, cfg):
