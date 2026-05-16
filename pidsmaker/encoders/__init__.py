@@ -1,5 +1,6 @@
 from .custom_mlp import CustomMLPAsbtract, CustomModel
 from .custom_mlp_encoder import CustomMLPAsbtract, CustomMLPEncoder
+from .edge_engineered_encoder import EdgeEngineeredEncoder
 from .gat import GAT
 from .gin import GIN
 from .glstm import GLSTM

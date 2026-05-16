@@ -1,0 +1,12 @@
+# Only Category 7: Burstiness / dominance features
+
+_include_yml: velox_edge_engineered
+
+edge_engineering:
+  category_1_pair: False
+  category_2_source: False
+  category_3_type: False
+  category_4_pair_type: False
+  category_5_source_type: False
+  category_6_global: False
+  category_7_burst: True

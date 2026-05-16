@@ -1,0 +1,24 @@
+# Velox baseline + rolling-window edge engineered features
+# Inherits: velox → orthrus_non_snooped → orthrus → default
+
+_include_yml: velox
+
+edge_engineering:
+  enabled: True
+  category_1_pair: True
+  category_2_source: True
+  category_3_type: True
+  category_4_pair_type: False
+  category_5_source_type: False
+  category_6_global: True
+  category_7_burst: False
+
+batching:
+  intra_graph_batching:
+    used_methods: edges
+  edge_features: "edge_type,engineered"
+
+training:
+  encoder:
+    used_methods: edge_engineered
+    x_is_tuple: True

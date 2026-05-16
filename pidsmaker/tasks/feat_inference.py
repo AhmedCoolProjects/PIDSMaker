@@ -3,6 +3,11 @@ import os
 import torch
 
 from pidsmaker.config import update_cfg_for_multi_dataset
+from pidsmaker.featurization.edge_engineering import (
+    RollingWindowFeatureComputer,
+    get_engineered_feat_dim,
+    parse_enabled_categories,
+)
 from pidsmaker.featurization.feat_inference_methods import (
     feat_inference_alacarte,
     feat_inference_doc2vec,
@@ -22,26 +27,38 @@ from pidsmaker.utils.utils import (
 )
 
 
-def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg):
+def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg, rel2id=None):
+    edge_eng_enabled = getattr(cfg, "edge_engineering", None) is not None and cfg.edge_engineering.enabled
+    if edge_eng_enabled:
+        enabled_cats = parse_enabled_categories(cfg.edge_engineering)
+        window_duration_ns = cfg.construction.time_window_size * 60_000_000_000
+        num_edge_types = cfg.dataset.num_edge_types
+        feat_dim = get_engineered_feat_dim(enabled_cats)
+
     for path in log_tqdm(sorted_paths, desc="Computing edge embeddings"):
         graph = torch.load(path)
-        sorted_edges = graph.edges(data=True, keys=True)
+
+        if edge_eng_enabled:
+            raw_edges = list(graph.edges(data=True, keys=True))
+            raw_edges.sort(key=lambda x: x[3]["time"])
+            featurizer = RollingWindowFeatureComputer(enabled_cats, window_duration_ns, num_edge_types)
+        else:
+            raw_edges = graph.edges(data=True, keys=True)
 
         src, dst, msg, t, y = [], [], [], [], []
-        for u, v, k, attr in sorted_edges:
+        eng_edge_data = [] if edge_eng_enabled else None
+
+        for u, v, k, attr in raw_edges:
             src.append(int(u))
             dst.append(int(v))
             t.append(int(attr["time"]))
             y.append(int(attr.get("y", 0)))
 
-            # If the graph structure has been changed in transformation, we may loose
-            # the edge label
             if "label" in attr:
                 edge_label = etype2oh[attr["label"]]
             else:
                 edge_label = torch.zeros_like(etype2oh[list(etype2oh.keys())[0]])
 
-            # Only types
             if indexid2vec is None:
                 msg.append(
                     torch.cat(
@@ -52,8 +69,6 @@ def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg):
                         ]
                     )
                 )
-
-            # Types + node embeddings
             else:
                 msg.append(
                     torch.cat(
@@ -67,13 +82,23 @@ def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg):
                     )
                 )
 
-        data = CollatableTemporalData(
-            src=torch.tensor(src).to(torch.long),
-            dst=torch.tensor(dst).to(torch.long),
-            t=torch.tensor(t).to(torch.long),
-            msg=torch.vstack(msg).to(torch.float),
-            y=torch.tensor(y).to(torch.long),
-        )
+            if edge_eng_enabled:
+                etype_idx = rel2id.get(attr.get("label"), 0)
+                eng_edge_data.append((int(u), int(v), etype_idx, int(attr["time"])))
+
+        data_kwargs = {
+            "src": torch.tensor(src).to(torch.long),
+            "dst": torch.tensor(dst).to(torch.long),
+            "t": torch.tensor(t).to(torch.long),
+            "msg": torch.vstack(msg).to(torch.float),
+            "y": torch.tensor(y).to(torch.long),
+        }
+
+        if edge_eng_enabled and len(eng_edge_data) > 0:
+            eng_feats = featurizer.compute(eng_edge_data)
+            data_kwargs["engineered_feats"] = eng_feats
+
+        data = CollatableTemporalData(**data_kwargs)
 
         os.makedirs(out_dir, exist_ok=True)
         file = path.split("/")[-1]
@@ -123,6 +148,7 @@ def main_from_config(cfg):
             sorted_paths=sorted_paths,
             out_dir=os.path.join(cfg.feat_inference._edge_embeds_dir, f"{split}/"),
             cfg=cfg,
+            rel2id=rel2id,
         )
 
 

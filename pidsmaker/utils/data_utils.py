@@ -229,6 +229,9 @@ def extract_msg_from_data(
             fields[field] = g.msg[:, idx : idx + size]
             idx += size
 
+        if hasattr(g, "engineered_feats") and g.engineered_feats is not None:
+            fields["engineered_feats"] = g.engineered_feats
+
         # Selects only the node features we want
         x_src, x_dst = [], []
         for feat in selected_node_feats:
@@ -339,6 +342,8 @@ def build_edge_feats(fields, msg, edge_features, possible_triplets, num_edge_typ
         edge_feats.append(triplets)
     if "msg" in edge_features:
         edge_feats.append(msg)
+    if "engineered" in edge_features and "engineered_feats" in fields:
+        edge_feats.append(fields["engineered_feats"])
     edge_feats = torch.cat(edge_feats, dim=-1) if len(edge_feats) > 0 else None
     return edge_feats
 

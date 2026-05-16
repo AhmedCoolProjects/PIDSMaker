@@ -1,0 +1,12 @@
+# Velox baseline + ALL 7 categories of edge engineered features
+
+_include_yml: velox_edge_engineered
+
+edge_engineering:
+  category_1_pair: True
+  category_2_source: True
+  category_3_type: True
+  category_4_pair_type: True
+  category_5_source_type: True
+  category_6_global: True
+  category_7_burst: True

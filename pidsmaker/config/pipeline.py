@@ -217,6 +217,8 @@ def set_task_paths(cfg, subtask_concat_value=None):
                 cfg._restart_from_scratch
             ):  # to start from a brand new folder, we generate a random id to add to the hash
                 restart_values += [cfg._run_random_seed]
+        if task == "feat_inference" and getattr(cfg, "edge_engineering", None) is not None and cfg.edge_engineering.enabled:
+            restart_values += flatten_arg_values(cfg.edge_engineering)
         if subtask_concat_value is not None:
             if task == subtask_concat_value["subtask"]:
                 restart_values += [subtask_concat_value["concat_value"]]

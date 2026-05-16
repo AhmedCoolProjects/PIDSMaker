@@ -643,6 +643,7 @@ ENCODERS_CFG = {
     "custom_mlp": {
         "architecture_str": Arg(str),
     },
+    "edge_engineered": {},
     "none": {},
 }
 
@@ -868,10 +869,11 @@ TASK_ARGS = {
         ),
         "edge_features": Arg(
             str,
-            vals=AND(["edge_type", "edge_type_triplet", "msg", "time_encoding", "none"]),
+            vals=AND(["edge_type", "edge_type_triplet", "msg", "time_encoding", "engineered", "none"]),
             desc="Edge features to used during GNN training. `edge_type` refers to the system call type, `edge_type_triplet` \
                                 considers a same edge type as a new type if source or destination node types are different, `msg` is the message vector \
-                                used in the TGN, `time_encoding` encodes temporal order of events with their timestamps in the TGN, `none` uses no features.",
+                                used in the TGN, `time_encoding` encodes temporal order of events with their timestamps in the TGN, \
+                                `engineered` uses rolling-window engineered edge features, `none` uses no features.",
         ),
         "multi_dataset_training": Arg(
             bool, desc="Whether the GNN should be trained on all datasets in `multi_dataset`."
@@ -1091,6 +1093,16 @@ TASK_ARGS = {
         },
     },
     "postprocessing": {},
+    "edge_engineering": {
+        "enabled": Arg(bool, desc="Whether to enable rolling-window engineered edge features."),
+        "category_1_pair": Arg(bool, desc="Category 1: Pair-level frequency and recency features."),
+        "category_2_source": Arg(bool, desc="Category 2: Source node fan-out and activity features."),
+        "category_3_type": Arg(bool, desc="Category 3: Edge-type level distribution features."),
+        "category_4_pair_type": Arg(bool, desc="Category 4: Fine-grained pair-type features."),
+        "category_5_source_type": Arg(bool, desc="Category 5: Source-edge type joint features."),
+        "category_6_global": Arg(bool, desc="Category 6: Global window activity features."),
+        "category_7_burst": Arg(bool, desc="Category 7: Burstiness / dominance features."),
+    },
 }
 
 EXPERIMENTS_CONFIG = {
