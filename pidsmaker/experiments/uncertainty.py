@@ -80,9 +80,9 @@ def prepare_for_deep_ensemble(cfg, iteration):
         restart_from = cfg.experiment.uncertainty.deep_ensemble.restart_from
         cfg = copy.deepcopy(cfg)
         if restart_from == "featurization":
-            cfg.featurization.seed += iteration
+            cfg.featurization.seed = (cfg.featurization.seed or 0) + iteration
         elif restart_from == "training":
-            cfg.training.seed += iteration
+            cfg.training.seed = (cfg.training.seed or 0) + iteration
         else:
             raise ValueError(f"Invalid `restart_from` value")
 
