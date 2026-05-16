@@ -334,9 +334,10 @@ def gen_edge_fused_tw(indexid2msg, cfg):
 
                     node_info = {}
                     edge_list = []
+                    fusion_idxs = []
                     if cfg.construction.fuse_edge:
                         edge_info = {}
-                        for (
+                        for raw_idx, (
                             src_node,
                             src_index_id,
                             operation,
@@ -345,7 +346,7 @@ def gen_edge_fused_tw(indexid2msg, cfg):
                             event_uuid,
                             timestamp_rec,
                             _id,
-                        ) in temp_list:
+                        ) in enumerate(temp_list):
                             if src_index_id not in node_info:
                                 node_type, label = indexid2msg[src_index_id]
                                 node_info[src_index_id] = {
@@ -363,7 +364,7 @@ def gen_edge_fused_tw(indexid2msg, cfg):
                                 edge_info[(src_index_id, dst_index_id)] = []
 
                             edge_info[(src_index_id, dst_index_id)].append(
-                                (timestamp_rec, operation, event_uuid)
+                                (timestamp_rec, operation, event_uuid, raw_idx)
                             )
 
                         for (src, dst), data in edge_info.items():
@@ -387,6 +388,7 @@ def gen_edge_fused_tw(indexid2msg, cfg):
                                 indices.append(current_start_index)
 
                             for k in indices:
+                                fusion_idxs.append(sorted_data[k][3])
                                 edge_list.append(
                                     {
                                         "src": src,
@@ -450,6 +452,14 @@ def gen_edge_fused_tw(indexid2msg, cfg):
                         NUM_TEST_EDGES = 2000
                         if cfg._test_mode and i >= NUM_TEST_EDGES:
                             break
+
+                    if cfg.construction.fuse_edge:
+                        raw_edges = [
+                            (s_id, d_id, op, ts)
+                            for (_, s_id, op, _, d_id, _, ts, _) in temp_list
+                        ]
+                        graph.graph["raw_edges"] = raw_edges
+                        graph.graph["fusion_idxs"] = fusion_idxs
 
                     date_dir = f"{cfg.construction._graphs_dir}/graph_{date}/"
                     os.makedirs(date_dir, exist_ok=True)

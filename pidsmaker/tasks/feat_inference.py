@@ -29,6 +29,12 @@ from pidsmaker.utils.utils import (
 
 def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg, rel2id=None):
     edge_eng_enabled = getattr(cfg, "edge_engineering", None) is not None and cfg.edge_engineering.enabled
+    before_fusion = (
+        edge_eng_enabled
+        and getattr(cfg.edge_engineering, "before_fusion", False)
+        and cfg.construction.fuse_edge
+    )
+
     if edge_eng_enabled:
         enabled_cats = parse_enabled_categories(cfg.edge_engineering)
         window_duration_ns = cfg.construction.time_window_size * 60_000_000_000
@@ -38,17 +44,11 @@ def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg, 
     for path in log_tqdm(sorted_paths, desc="Computing edge embeddings"):
         graph = torch.load(path)
 
-        if edge_eng_enabled:
-            raw_edges = list(graph.edges(data=True, keys=True))
-            raw_edges.sort(key=lambda x: x[3]["time"])
-            featurizer = RollingWindowFeatureComputer(enabled_cats, window_duration_ns, num_edge_types)
-        else:
-            raw_edges = graph.edges(data=True, keys=True)
+        graph_edges = list(graph.edges(data=True, keys=True))
+        graph_edges.sort(key=lambda x: x[3]["time"])
 
         src, dst, msg, t, y = [], [], [], [], []
-        eng_edge_data = [] if edge_eng_enabled else None
-
-        for u, v, k, attr in raw_edges:
+        for u, v, k, attr in graph_edges:
             src.append(int(u))
             dst.append(int(v))
             t.append(int(attr["time"]))
@@ -82,10 +82,6 @@ def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg, 
                     )
                 )
 
-            if edge_eng_enabled:
-                etype_idx = rel2id.get(attr.get("label"), 0)
-                eng_edge_data.append((int(u), int(v), etype_idx, int(attr["time"])))
-
         data_kwargs = {
             "src": torch.tensor(src).to(torch.long),
             "dst": torch.tensor(dst).to(torch.long),
@@ -94,8 +90,23 @@ def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg, 
             "y": torch.tensor(y).to(torch.long),
         }
 
-        if edge_eng_enabled and len(eng_edge_data) > 0:
-            eng_feats = featurizer.compute(eng_edge_data)
+        if edge_eng_enabled:
+            featurizer = RollingWindowFeatureComputer(enabled_cats, window_duration_ns, num_edge_types)
+            if before_fusion and "raw_edges" in graph.graph:
+                raw_edges_data = graph.graph["raw_edges"]
+                fusion_idxs = graph.graph["fusion_idxs"]
+                eng_edge_data = [
+                    (int(s), int(d), rel2id.get(op, 0), int(ts))
+                    for (s, d, op, ts) in raw_edges_data
+                ]
+                all_feats = featurizer.compute(eng_edge_data)
+                eng_feats = all_feats[fusion_idxs]
+            else:
+                eng_edge_data = []
+                for u, v, k, attr in graph_edges:
+                    etype_idx = rel2id.get(attr.get("label"), 0)
+                    eng_edge_data.append((int(u), int(v), etype_idx, int(attr["time"])))
+                eng_feats = featurizer.compute(eng_edge_data)
             data_kwargs["engineered_feats"] = eng_feats
 
         data = CollatableTemporalData(**data_kwargs)

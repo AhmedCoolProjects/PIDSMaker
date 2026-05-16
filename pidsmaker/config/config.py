@@ -1095,6 +1095,7 @@ TASK_ARGS = {
     "postprocessing": {},
     "edge_engineering": {
         "enabled": Arg(bool, desc="Whether to enable rolling-window engineered edge features."),
+        "before_fusion": Arg(bool, desc="If True, compute engineered features on the pre-fusion edge stream. Only relevant when construction.fuse_edge=True."),
         "category_1_pair": Arg(bool, desc="Category 1: Pair-level frequency and recency features."),
         "category_2_source": Arg(bool, desc="Category 2: Source node fan-out and activity features."),
         "category_3_type": Arg(bool, desc="Category 3: Edge-type level distribution features."),
