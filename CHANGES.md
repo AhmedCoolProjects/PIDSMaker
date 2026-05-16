@@ -1,5 +1,32 @@
 # Changelog
 
+## 2026-05-16 — Edge Engineered Features + before_fusion
+
+### New Features
+
+- **Rolling-window engineered edge features** (new module `pidsmaker/featurization/edge_engineering/`): Adds 7 toggleable categories of causal statistical edge features computed over a rolling time window:
+  - Category 1: Pair-level frequency & recency (7 dims)
+  - Category 2: Source node fan-out & activity (6 dims)
+  - Category 3: Edge-type distribution (4 dims)
+  - Category 4: Fine-grained pair-type features (4 dims)
+  - Category 5: Source-edge type joint features (3 dims)
+  - Category 6: Global window activity (7 dims)
+  - Category 7: Burstiness / dominance (3 dims)
+
+- **EdgeEngineeredEncoder** (`pidsmaker/encoders/edge_engineered_encoder.py`): New encoder that consumes engineered edge features alongside node embeddings. Projects edge features, then combines with src/dst node embeddings via a linear layer.
+
+- **Per-category configs** (`config/velox_edge_cat1.yml` through `cat7.yml`): Each enables a single category. `velox_edge_engineered.yml` enables categories 1+2+3+6. `velox_edge_engineered_all.yml` enables all 7.
+
+- **`before_fusion` option** (`edge_engineering.before_fusion`): When `True` (requires `construction.fuse_edge=True`), the `RollingWindowFeatureComputer` processes the **pre-fusion** edge stream so its statistical features reflect unfused events.
+
+### Bug Fixes
+
+- **Feat_inference cache collision** (`pipeline.py`): `feat_inference` task path hash now includes `edge_engineering` config settings, preventing cache collisions between different category configurations.
+
+### Improvements
+
+- **Deep ensemble restart** (`run_n_times.yml`): Changed `restart_from` from `featurization` to `training` to avoid redundant recomputation of featurization and feat_inference across iterations.
+
 ## 2026-05-15 — wandb Metrics Reporting Fixes
 
 ### Bug Fixes
