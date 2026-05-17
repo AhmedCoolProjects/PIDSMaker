@@ -1,12 +1,12 @@
 # Simply runs an experiment N times and return the mean of metrics + std
 
 training_loop:
-  run_evaluation: each_epoch
+    run_evaluation: each_epoch
 
 experiment:
-  used_method: uncertainty
-  uncertainty:
-    deep_ensemble:
-      method: increasing_seed
-      iterations: 3
-      restart_from: featurization
+    used_method: uncertainty
+    uncertainty:
+        deep_ensemble:
+            method: increasing_seed
+            iterations: 3
+            restart_from: training
