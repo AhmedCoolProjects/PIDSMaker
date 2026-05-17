@@ -8,4 +8,3 @@ batching:
 training:
   encoder:
     used_methods: none # uses only a linear layer
-    x_is_tuple: True
