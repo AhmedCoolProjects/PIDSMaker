@@ -3,6 +3,7 @@
 _include_yml: velox_edge_engineered
 
 edge_engineering:
+  before_fusion: True
   category_1_pair: False
   category_2_source: False
   category_3_type: False

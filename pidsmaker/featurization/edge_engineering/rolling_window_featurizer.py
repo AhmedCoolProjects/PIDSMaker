@@ -42,6 +42,13 @@ class RollingWindowFeatureComputer:
     edge or future edges.
 
     Feature categories (1-7) are individually toggleable via config.
+
+    Performance notes:
+      - _cat6_global avg_fan_out is O(1) per edge via running _total_fan_out counter.
+      - _cat1_pair IAT statistics use Welford's online algorithm (O(1) per edge
+        instead of O(k) recomputation from scratch).
+      - No unbounded timestamp lists: pair_timestamps is replaced by lightweight
+        running counters (pair_count, pair_first_ts, pair_last_ts + IAT stats).
     """
 
     def __init__(self, enabled_categories, window_duration_ns, num_edge_types):
@@ -53,22 +60,41 @@ class RollingWindowFeatureComputer:
         self.reset()
 
     def reset(self):
-        self.pair_timestamps = defaultdict(list)
+        # --- pair-level state (replaces pair_timestamps list) ---
+        self.pair_count = defaultdict(int)
+        self.pair_first_ts = {}
+        self.pair_last_ts = {}
+        self.pair_iat_mean = defaultdict(float)
+        self.pair_iat_m2 = defaultdict(float)
+        self.pair_iat_n = defaultdict(int)
+
+        # --- source-level state ---
         self.src_count = defaultdict(int)
         self.src_last_seen = {}
         self.src_unique_dst = defaultdict(set)
         self.src_unique_types = defaultdict(set)
+
+        # --- per-edge-type state ---
         self.type_count = defaultdict(int)
         self.type_last_seen = {}
+
+        # --- (src, dst, type) triple state ---
         self.triple_count = defaultdict(int)
         self.triple_last_seen = {}
+
+        # --- (src, type) state ---
         self.src_type_count = defaultdict(int)
         self.src_type_last_seen = {}
+
+        # --- global window state ---
         self.window_total = 0
         self.window_src_set = set()
         self.window_dst_set = set()
         self.window_pair_set = set()
         self.window_type_set = set()
+
+        # running sum of src fan-outs (for O(1) avg_fan_out in cat6)
+        self._total_fan_out = 0
 
     def compute(self, edges):
         """
@@ -111,17 +137,45 @@ class RollingWindowFeatureComputer:
         triple_key = (src, dst, etype_idx)
         src_type_key = (src, etype_idx)
 
-        self.pair_timestamps[pair_key].append(ts)
+        # --- pair IAT running stats (Welford, before updating count/last) ---
+        if pair_key in self.pair_last_ts:
+            prev_ts = self.pair_last_ts[pair_key]
+            iat = ts - prev_ts
+            self.pair_iat_n[pair_key] += 1
+            n = self.pair_iat_n[pair_key]
+            mean = self.pair_iat_mean[pair_key]
+            delta = iat - mean
+            self.pair_iat_mean[pair_key] = mean + delta / n
+            self.pair_iat_m2[pair_key] += delta * (iat - self.pair_iat_mean[pair_key])
+        else:
+            self.pair_first_ts[pair_key] = ts
+
+        self.pair_last_ts[pair_key] = ts
+        self.pair_count[pair_key] += 1
+
+        # --- running total_fan_out (for O(1) avg_fan_out in cat6) ---
+        if dst not in self.src_unique_dst[src]:
+            self._total_fan_out += 1
+
+        # --- source state ---
         self.src_count[src] += 1
         self.src_last_seen[src] = ts
         self.src_unique_dst[src].add(dst)
         self.src_unique_types[src].add(etype_idx)
+
+        # --- type state ---
         self.type_count[etype_idx] += 1
         self.type_last_seen[etype_idx] = ts
+
+        # --- triple state ---
         self.triple_count[triple_key] += 1
         self.triple_last_seen[triple_key] = ts
+
+        # --- src-type state ---
         self.src_type_count[src_type_key] += 1
         self.src_type_last_seen[src_type_key] = ts
+
+        # --- global window ---
         self.window_total += 1
         self.window_src_set.add(src)
         self.window_dst_set.add(dst)
@@ -136,8 +190,9 @@ class RollingWindowFeatureComputer:
         return min(delta_ns / self.window_duration_ns, 1.0)
 
     def _cat1_pair(self, pair_key, ts):
-        ts_list = self.pair_timestamps.get(pair_key, [])
-        count = len(ts_list)
+        count = self.pair_count.get(pair_key, 0)
+        last_ts = self.pair_last_ts.get(pair_key)
+        first_ts = self.pair_first_ts.get(pair_key)
 
         if count == 0:
             time_since_last = 1.0
@@ -146,20 +201,18 @@ class RollingWindowFeatureComputer:
             iat_mean = 0.0
             iat_std = 0.0
         else:
-            last_ts = ts_list[-1]
-            first_ts = ts_list[0]
             time_since_last = self._time_ratio(ts - last_ts)
-            first_seen_offset = self._time_ratio(ts - first_ts) if count > 0 else 0.0
+            first_seen_offset = self._time_ratio(ts - first_ts)
             span = self._time_ratio(last_ts - first_ts) if count > 1 else 0.0
 
-            if count >= 2:
-                diffs = [ts_list[i] - ts_list[i - 1] for i in range(1, len(ts_list))]
-                iat_mean = sum(diffs) / len(diffs) / self.window_duration_ns
-                if count >= 3:
-                    var = sum((d - sum(diffs) / len(diffs)) ** 2 for d in diffs) / len(diffs)
-                    iat_std = math.sqrt(var) / self.window_duration_ns
-                else:
-                    iat_std = 0.0
+            iat_n = self.pair_iat_n.get(pair_key, 0)
+            if iat_n >= 1:
+                iat_mean = self.pair_iat_mean[pair_key] / self.window_duration_ns
+                iat_std = (
+                    math.sqrt(self.pair_iat_m2[pair_key] / iat_n) / self.window_duration_ns
+                    if iat_n >= 2
+                    else 0.0
+                )
             else:
                 iat_mean = 0.0
                 iat_std = 0.0
@@ -192,7 +245,7 @@ class RollingWindowFeatureComputer:
         count = self.triple_count.get(triple_key, 0)
         last_ts = self.triple_last_seen.get(triple_key)
         time_since_last = self._time_ratio(ts - last_ts) if last_ts is not None else 1.0
-        pair_count = len(self.pair_timestamps.get(pair_key, []))
+        pair_count = self.pair_count.get(pair_key, 0)
         ratio_in_pair = count / max(pair_count, 1)
         type_count = self.type_count.get(etype_idx, 0)
         ratio_in_type = count / max(type_count, 1)
@@ -226,19 +279,17 @@ class RollingWindowFeatureComputer:
         else:
             norm_entropy = 0.0
 
-        if unique_src > 0:
-            fan_outs = []
-            for s in self.window_src_set:
-                fan_outs.append(len(self.src_unique_dst.get(s, set())))
-            avg_fan_out = sum(fan_outs) / unique_src
-        else:
-            avg_fan_out = 0.0
+        avg_fan_out = (
+            self._total_fan_out / max(len(self.window_src_set), 1)
+            if self.window_src_set
+            else 0.0
+        )
 
         return [total, unique_src, unique_dst, unique_pairs, unique_types, norm_entropy, avg_fan_out]
 
     def _cat7_burst(self, pair_key, src, triple_key):
         total = max(self.window_total, 1)
-        pair_count = len(self.pair_timestamps.get(pair_key, []))
+        pair_count = self.pair_count.get(pair_key, 0)
         src_count = self.src_count.get(src, 0)
         triple_count = self.triple_count.get(triple_key, 0)
 
