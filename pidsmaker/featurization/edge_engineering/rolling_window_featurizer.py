@@ -1,3 +1,4 @@
+import bisect
 import math
 from collections import defaultdict
 
@@ -12,6 +13,7 @@ CATEGORY_DIMS = {
     5: 3,
     6: 7,
     7: 3,
+    8: 6,
 }
 
 
@@ -28,6 +30,7 @@ def parse_enabled_categories(edge_eng_cfg):
         5: getattr(edge_eng_cfg, "category_5_source_type", False),
         6: getattr(edge_eng_cfg, "category_6_global", False),
         7: getattr(edge_eng_cfg, "category_7_burst", False),
+        8: getattr(edge_eng_cfg, "category_8_temporal", False),
     }
     return [c for c, enabled in mapping.items() if enabled]
 
@@ -36,12 +39,15 @@ class RollingWindowFeatureComputer:
     """
     Computes rolling-window engineered edge features for one time-window graph.
 
-    Processes edges in chronological order. For each edge, features are read
-    from the current state (before insertion), then the state is updated.
-    This guarantees causality: no feature leaks information from the current
-    edge or future edges.
+    Two modes:
+      - "causal" (default): For each edge, features are read from the current state
+        (before insertion), then the state is updated. Guarantees causality.
+      - "full_window": Two-pass. First updates state with ALL edges, then reads
+        features from the final (complete) state. Every edge sees the full window's
+        statistics. No leakage concern since the pipeline processes full windows.
 
-    Feature categories (1-7) are individually toggleable via config.
+    Feature categories (1-8) are individually toggleable via config.
+    Category 8 (temporal position) requires full_window mode.
 
     Performance notes:
       - _cat6_global avg_fan_out is O(1) per edge via running _total_fan_out counter.
@@ -51,12 +57,17 @@ class RollingWindowFeatureComputer:
         running counters (pair_count, pair_first_ts, pair_last_ts + IAT stats).
     """
 
-    def __init__(self, enabled_categories, window_duration_ns, num_edge_types):
+    def __init__(self, enabled_categories, window_duration_ns, num_edge_types, mode="causal"):
+        self.mode = mode
         self.enabled = sorted(enabled_categories)
         self.window_duration_ns = window_duration_ns
         self.window_duration_s = window_duration_ns / 1e9
         self.num_edge_types = num_edge_types
         self.out_dim = get_engineered_feat_dim(self.enabled)
+
+        if 8 in self.enabled and self.mode != "full_window":
+            raise ValueError("Category 8 (temporal) requires mode='full_window'")
+
         self.reset()
 
     def reset(self):
@@ -96,6 +107,12 @@ class RollingWindowFeatureComputer:
         # running sum of src fan-outs (for O(1) avg_fan_out in cat6)
         self._total_fan_out = 0
 
+        # full_window state for cat8 temporal features
+        self._window_min_ts = None
+        self._window_max_ts = None
+        self._window_span_ns = 1
+        self._all_timestamps = []
+
     def compute(self, edges):
         """
         edges: list of (src, dst, edge_type_idx, timestamp_ns) sorted by time.
@@ -107,6 +124,48 @@ class RollingWindowFeatureComputer:
             feats = self._read_features(src, dst, etype_idx, ts)
             self._update_state(src, dst, etype_idx, ts)
             all_feats.append(feats)
+        return torch.tensor(all_feats, dtype=torch.float)
+
+    def compute_full_window(self, edges):
+        """
+        Two-pass full-window feature computation.
+
+        Pass 1: update state with ALL edges (no reads).
+        Pass 2: read features for each edge from the final (complete) state.
+
+        edges: list of (src, dst, edge_type_idx, timestamp_ns) sorted by time.
+        Returns: (E, out_dim) tensor of engineered features.
+        """
+        self._all_timestamps = [ts for _, _, _, ts in edges]
+        self._window_min_ts = min(self._all_timestamps)
+        self._window_max_ts = max(self._all_timestamps)
+        self._window_span_ns = max(self._window_max_ts - self._window_min_ts, 1)
+
+        # Pass 1: build state from all edges
+        for src, dst, etype_idx, ts in edges:
+            self._update_state(src, dst, etype_idx, ts)
+
+        # Pre-compute local density values via sliding window
+        half_bucket = self.window_duration_ns / 200
+        n = len(edges)
+        self._density_values = [0.0] * n
+        left = 0
+        right = 0
+        for i, (_, _, _, ts) in enumerate(edges):
+            while right < n and edges[right][3] - ts <= half_bucket:
+                right += 1
+            while left < n and ts - edges[left][3] > half_bucket:
+                left += 1
+            self._density_values[i] = (right - left) / max(n, 1)
+
+        # Pass 2: read features from final state
+        all_feats = []
+        for i, (src, dst, etype_idx, ts) in enumerate(edges):
+            self._current_density = self._density_values[i]
+            feats = self._read_features(src, dst, etype_idx, ts)
+            all_feats.append(feats)
+
+        self._current_density = 0.0
         return torch.tensor(all_feats, dtype=torch.float)
 
     def _read_features(self, src, dst, etype_idx, ts):
@@ -130,6 +189,8 @@ class RollingWindowFeatureComputer:
                 feats.extend(self._cat6_global(ts))
             elif cat == 7:
                 feats.extend(self._cat7_burst(pair_key, src, triple_key))
+            elif cat == 8:
+                feats.extend(self._cat8_temporal(ts))
         return feats
 
     def _update_state(self, src, dst, etype_idx, ts):
@@ -298,3 +359,12 @@ class RollingWindowFeatureComputer:
         triple_dominance = triple_count / total
 
         return [pair_burst, src_burst, triple_dominance]
+
+    def _cat8_temporal(self, ts):
+        pos = (ts - self._window_min_ts) / self._window_span_ns
+        time_from_start = (ts - self._window_min_ts) / self.window_duration_ns
+        time_to_end = (self._window_max_ts - ts) / self.window_duration_ns
+        density = getattr(self, "_current_density", 0.0)
+        is_first_q = 1.0 if pos < 0.25 else 0.0
+        is_last_q = 1.0 if pos > 0.75 else 0.0
+        return [pos, time_from_start, time_to_end, density, is_first_q, is_last_q]

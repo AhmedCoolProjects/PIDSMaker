@@ -345,3 +345,68 @@ edge in the pre-fusion stream.
 | Cat 7    | Read-only from cat 1/2/4 counters | O(1) | None (reuses existing) |
 
 Total per-edge cost: **O(1)** for all categories with online algorithms.
+
+---
+
+## V2: Full-Window Mode (Non-Causal)
+
+### Motivation
+
+Our pipeline collects a complete time-windowed graph first, then applies detection on the full
+window. Since the entire window is always available, there is **no temporal leakage concern**.
+Full-window features let every edge see the **complete window's statistics**.
+
+### Two Modes
+
+| Mode | Behavior | Use case |
+|------|----------|----------|
+| `causal` (default) | Read-before-update per edge. Edge *i* sees edges 0..i-1. | Streaming / real-time |
+| `full_window` | Two-pass: (1) update state from ALL edges, (2) read from final state. | Batch / full-window detection |
+
+Config:
+```yaml
+edge_engineering:
+  enabled: True
+  mode: "full_window"   # "causal" (default) or "full_window"
+  before_fusion: True
+```
+
+### Key Differences
+
+| Feature | Causal | Full-window |
+|---------|--------|-------------|
+| `pair_count` | Occurrences up to current edge | Total occurrences in window |
+| `window_total_edges` | Grows with each edge (0 → N) | Same value for all edges (= N) |
+| `src_burst_ratio` | Changes as more src edges arrive | True dominance ratio across window |
+| `pair_inter_arrival_mean` | IAT up to current occurrence | IAT across ALL pair occurrences |
+| Edge at position 0 | Sees empty state (sparse features) | Sees full window (rich features) |
+
+### Category 8 — Temporal Position (new, 6 dims)
+
+Only meaningful in `full_window` mode. Leverages knowledge of the complete window's time bounds.
+
+| # | Feature | Calculation | APT signal |
+|---|---------|-------------|------------|
+| 1 | `time_position` | `(ts - min_ts) / (max_ts - min_ts)` in [0,1] | Where in the window does this edge fall? |
+| 2 | `time_from_start` | `(ts - min_ts) / window_duration` | How far into the window |
+| 3 | `time_to_end` | `(max_ts - ts) / window_duration` | Time remaining — small near exfiltration |
+| 4 | `local_edge_density` | Edges in ±window/200 bucket / total | Burst detection at this timestamp |
+| 5 | `is_first_quarter` | `1 if time_position < 0.25 else 0` | Initial compromise often in Q1 |
+| 6 | `is_last_quarter` | `1 if time_position > 0.75 else 0` | Exfiltration often in Q4 |
+
+### Config Files
+
+| Config | Mode | Cats | before_fusion |
+|--------|------|------|---------------|
+| `velox_edge_full_window.yml` | full_window | 1-7 (same as engineered) | True |
+| `velox_edge_full_window_all.yml` | full_window | 1-8 (all) | True |
+| `velox_edge_fw_cat8.yml` | full_window | 8 only | True |
+
+### Performance
+
+| Category | Data structure | Time per edge |
+|----------|---------------|---------------|
+| Cat 8 | Window bounds + sliding window density | O(log N) via bisect / O(N) via sliding window |
+
+Total for all 8 categories: still **O(1) per edge** (density pre-computed via sliding window in
+Pass 1).

@@ -1,0 +1,17 @@
+# Velox baseline + full-window edge engineered features (all 8 categories)
+# Includes Category 8 temporal position features.
+# Inherits: velox_edge_engineered → velox → orthrus_non_snooped → orthrus → default
+
+_include_yml: velox_edge_engineered
+
+edge_engineering:
+  mode: "full_window"
+  before_fusion: True
+  category_1_pair: True
+  category_2_source: True
+  category_3_type: True
+  category_4_pair_type: True
+  category_5_source_type: True
+  category_6_global: True
+  category_7_burst: True
+  category_8_temporal: True

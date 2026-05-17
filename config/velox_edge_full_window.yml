@@ -1,0 +1,9 @@
+# Velox baseline + full-window edge engineered features (non-causal)
+# All 7 original categories computed from complete window statistics.
+# Inherits: velox_edge_engineered → velox → orthrus_non_snooped → orthrus → default
+
+_include_yml: velox_edge_engineered
+
+edge_engineering:
+  mode: "full_window"
+  before_fusion: True

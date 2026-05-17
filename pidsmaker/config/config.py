@@ -1095,6 +1095,7 @@ TASK_ARGS = {
     "postprocessing": {},
     "edge_engineering": {
         "enabled": Arg(bool, desc="Whether to enable rolling-window engineered edge features."),
+        "mode": Arg(str, vals=OR(["causal", "full_window"]), desc="Feature computation mode: 'causal' (prefix-state, default) or 'full_window' (two-pass, final-state)."),
         "before_fusion": Arg(bool, desc="If True, compute engineered features on the pre-fusion edge stream. Only relevant when construction.fuse_edge=True."),
         "category_1_pair": Arg(bool, desc="Category 1: Pair-level frequency and recency features."),
         "category_2_source": Arg(bool, desc="Category 2: Source node fan-out and activity features."),
@@ -1103,6 +1104,7 @@ TASK_ARGS = {
         "category_5_source_type": Arg(bool, desc="Category 5: Source-edge type joint features."),
         "category_6_global": Arg(bool, desc="Category 6: Global window activity features."),
         "category_7_burst": Arg(bool, desc="Category 7: Burstiness / dominance features."),
+        "category_8_temporal": Arg(bool, desc="Category 8: Temporal position features (requires mode='full_window')."),
     },
 }
 
