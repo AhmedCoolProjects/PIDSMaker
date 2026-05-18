@@ -8,6 +8,7 @@ Provides custom PyTorch Geometric data structures and utilities for:
 """
 
 import copy
+import gc
 import math
 import os
 import pickle
@@ -132,9 +133,13 @@ def load_all_datasets(cfg, device, only_keep=None):
 
     # Global batching (unique edge type batches, fixed-size edge length)
     datasets = run_global_batching(train_data, val_data, test_data, cfg, device)
+    del train_data, val_data, test_data
+    gc.collect()
 
     # Intra graph batching (TGN 1024 batches, last neighbor loader)
     datasets = run_intra_graph_batching(datasets, full_data, device, max_node, cfg, graph_reindexer)
+    del full_data
+    gc.collect()
 
     # Reindexing stuff (create node-level attributes)
     datasets = run_reindexing_preprocessing(datasets, graph_reindexer, device, cfg)
