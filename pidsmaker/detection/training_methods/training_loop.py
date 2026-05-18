@@ -10,6 +10,7 @@ Handles model training with:
 """
 
 import copy
+import gc
 import tracemalloc
 from time import perf_counter as timer
 
@@ -55,11 +56,13 @@ def main(cfg):
     tracemalloc.start()
 
     train_data, val_data, test_data, max_node_num = get_preprocessed_graphs(cfg)
+    gc.collect()
 
     model = build_model(
         data_sample=train_data[0][0], device=device, cfg=cfg, max_node_num=max_node_num
     )
     optimizer = optimizer_factory(cfg, parameters=set(model.parameters()))
+    gc.collect()
 
     run_evaluation = cfg.training_loop.run_evaluation
     assert run_evaluation in ["best_epoch", "each_epoch"], (
@@ -128,6 +131,7 @@ def main(cfg):
             _, peak_inference_cpu_memory = tracemalloc.get_traced_memory()
             peak_train_cpu_mem = max(peak_train_cpu_mem, peak_inference_cpu_memory / (1024**3))
             tracemalloc.stop()
+            gc.collect()
 
             if use_cuda:
                 peak_inference_gpu_memory = torch.cuda.max_memory_allocated(device=device) / (
@@ -245,6 +249,9 @@ def main(cfg):
             )
 
     # After training
+    del train_data
+    gc.collect()
+
     if best_epoch_mode:
         model.load_state_dict(best_model)
         test_stats = inference_loop.main(
