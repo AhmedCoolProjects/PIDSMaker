@@ -120,7 +120,30 @@ def load_all_datasets(cfg, device, only_keep=None):
         val_data = val_data[:only_keep]
         test_data = test_data[:only_keep]
 
-    full_data = get_full_data([train_data, val_data, test_data])
+    # TGN's last-neighbor batching is the only consumer of the heavy fields
+    # (msg / t / edge_type) on `full_data`. Skipping them saves a full extra
+    # copy of the per-edge msg tensor (~half the in-RAM dataset) for every
+    # non-TGN system.
+    intra_methods = cfg.batching.intra_graph_batching.used_methods or ""
+    use_tgn_last_neighbor = "tgn_last_neighbor" in intra_methods
+    full_keys = ["msg", "t", "edge_type", "src", "dst"] if use_tgn_last_neighbor else ["src", "dst"]
+    full_data = get_full_data([train_data, val_data, test_data], keys=full_keys)
+
+    # `full_data.msg` (when present) already holds everything `compute_tgn_graphs`
+    # needs via e_id-indexed slices. The per-graph wide `msg` tensors that fed
+    # into it are no longer required by any downstream step (encoders read the
+    # rebuilt narrow `msg` set in `extract_msg_from_data` only when TGN+memory
+    # is enabled). Free them now to halve the resident dataset size.
+    use_tgn_memory = (
+        "tgn" in cfg.training.encoder.used_methods and cfg.training.encoder.tgn.use_memory
+    )
+    if not use_tgn_memory:
+        for split in (train_data, val_data, test_data):
+            for dataset in split:
+                for g in dataset:
+                    if "msg" in g._store:
+                        del g.msg
+        gc.collect()
 
     max_node = torch.cat([full_data.src, full_data.dst]).max().item() + 1
     print(f"Max node in {cfg.dataset.name}: {max_node}")
@@ -295,12 +318,15 @@ def extract_msg_from_data(
         g.x_src = x_src
         g.x_dst = x_dst
         g.edge_feats = edge_feats
-        g.edge_type = edge_type
-        g.node_type_src = fields["src_type"]
-        g.node_type_dst = fields["dst_type"]
+        # node_type_src/dst (and edge_type when not using triplets) are views into the
+        # original g.msg. Cloning detaches them so the wide msg can be freed later by
+        # callers (e.g. once `full_data` is built and per-graph msg is no longer needed).
+        g.edge_type = edge_type if edge_type is not fields["edge_type"] else edge_type.clone()
+        g.node_type_src = fields["src_type"].clone()
+        g.node_type_dst = fields["dst_type"].clone()
 
         if "tgn" in cfg.training.encoder.used_methods and cfg.training.encoder.tgn.use_memory:
-            g.msg = msg
+            g.msg = msg  # smaller rebuilt msg; original wide msg can now be GC'd
 
         # NOTE: do not add edge_index as it is already within `CollatableTemporalData`
         # g.edge_index = ...
@@ -348,10 +374,17 @@ def build_edge_feats(fields, msg, edge_features, possible_triplets, num_edge_typ
     return edge_feats
 
 
-def get_full_data(datasets):
-    all_data = {
-        k: [] for k in ["msg", "t", "edge_type", "node_type_src", "node_type_dst", "src", "dst"]
-    }
+def get_full_data(datasets, keys=None):
+    """Concatenate per-graph attributes into a single Data object.
+
+    Only the keys actually consumed downstream are gathered (default: msg, t,
+    edge_type, src, dst — `node_type_src/dst` were collected historically but
+    never read). The narrower set lets callers skip work entirely when they
+    don't need the TGN-only fields.
+    """
+    if keys is None:
+        keys = ["msg", "t", "edge_type", "src", "dst"]
+    all_data = {k: [] for k in keys}
     for dataset_group in datasets:
         for dataset in dataset_group:
             for data in dataset:
@@ -359,6 +392,9 @@ def get_full_data(datasets):
                     all_data[k].append(getattr(data, k))
 
     full_data = Data(**{k: torch.cat(v) for k, v in all_data.items()})
+    # Free the per-key Python lists holding view references onto every graph
+    # before returning (frees one extra reference each, allowing earlier GC).
+    all_data.clear()
     return full_data
 
 
