@@ -35,4 +35,12 @@ Format for each entry:
 > Then append this prompt to prompts.md and commit+push that too as a second commit.
 
 **Agent action:** Committed and pushed the implementation, then appended this prompt entry and committed+separately.
+
+---
+
+### [2026-05-18 3] — Fix op2id crash in feat_inference.py
+**Prompt:**
+> The run failed: `AttributeError: 'str' object has no attribute 'argmax'` on line 57 — `etype2oh` values are strings, not tensors. Fix op2id to use rel2id instead. Show diff, no commit.
+
+**Agent action:** Root cause: `gen_relation_onehot` returns a bidirectional dict mixing tensor and string values. Fixed by passing `rel2id` (which maps op_name→int) as a parameter, deriving zero-based `op2id` from it with proper type filtering and dynamic offset adjustment.
 ---

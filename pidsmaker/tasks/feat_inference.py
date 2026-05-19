@@ -23,7 +23,7 @@ from pidsmaker.utils.utils import (
 )
 
 
-def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg):
+def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg, rel2id=None):
     edge_engineering_enabled = getattr(cfg.batching, "edge_engineering", None) and cfg.batching.edge_engineering.enabled
 
     for path in log_tqdm(sorted_paths, desc="Computing edge embeddings"):
@@ -37,7 +37,7 @@ def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg):
 
         if edge_engineering_enabled:
             eng_cfg = cfg.batching.edge_engineering
-            num_op_types = len(etype2oh)
+            num_op_types = len(rel2id) if rel2id is not None else 0
             ema_alpha = eng_cfg.ema_alpha
             use_log1p = eng_cfg.normalization.strip() == "log1p"
             families = eng_cfg.feature_families
@@ -54,7 +54,13 @@ def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg):
                 if enabled_flag:
                     enabled.add(name)
             computer = EngineeredFeatureComputer(num_op_types, ema_alpha, use_log1p, enabled)
-            op2id = {op: oh.argmax().item() for op, oh in etype2oh.items()}
+            op2id = {
+                op: idx for op, idx in rel2id.items()
+                if isinstance(op, str) and isinstance(idx, int)
+            }
+            if op2id:
+                min_id = min(op2id.values())
+                op2id = {op: idx - min_id for op, idx in op2id.items()}
 
         for u, v, k, attr in sorted_edges:
             src.append(int(u))
@@ -168,6 +174,7 @@ def main_from_config(cfg):
             sorted_paths=sorted_paths,
             out_dir=os.path.join(cfg.feat_inference._edge_embeds_dir, f"{split}/"),
             cfg=cfg,
+            rel2id=rel2id,
         )
 
 
