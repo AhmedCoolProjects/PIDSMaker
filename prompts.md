@@ -23,4 +23,16 @@ Format for each entry:
 > Full prompt text in conversation history.
 
 **Agent action:** Read all relevant source files, composed pre-implementation analysis with 6 feature families, design pitch, then implemented full end-to-end: `engineered_feats.py`, `linear_edge_feat_encoder.py`, wiring through `feat_inference.py`, `data_utils.py`, `factory.py`, `config.py`, `velox.yml`. No commits.
+
+---
+
+### [2026-05-18 2] — Commit and push instruction
+**Prompt:**
+> Commit your changes to YOUR branch only (fe_edge-bigpickle). Do NOT merge or push to fe_edge.
+>
+> git add -A && git commit -m "v0.1 engineered edge features (draft for ablation)" && git push origin HEAD
+>
+> Then append this prompt to prompts.md and commit+push that too as a second commit.
+
+**Agent action:** Committed and pushed the implementation, then appended this prompt entry and committed+separately.
 ---
