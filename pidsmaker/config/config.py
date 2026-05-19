@@ -643,6 +643,7 @@ ENCODERS_CFG = {
     "custom_mlp": {
         "architecture_str": Arg(str),
     },
+    "linear_edge_feat": {},
     "none": {},
 }
 
@@ -775,6 +776,13 @@ THRESHOLD_METHODS = ["max_val_loss", "mean_val_loss", "threatrace", "magic", "fl
 
 # --- Tasks, subtasks, and argument configurations ---
 TASK_ARGS = {
+    "edge_engineering": {
+        "enabled": Arg(bool, desc="Toggle edge engineering features"),
+        "features": Arg(str, desc="Comma separated list of features to use"),
+        "ema_alpha": Arg(float, desc="Alpha for EMA decay"),
+        "normalize_counts": Arg(bool, desc="Whether to apply log1p to count features"),
+        "standardize_time": Arg(bool, desc="Whether to standardize inter-arrival times per window"),
+    },
     "construction": {
         "used_method": Arg(
             str, vals=OR(["default", "magic"]), desc="The method to build time window graphs."

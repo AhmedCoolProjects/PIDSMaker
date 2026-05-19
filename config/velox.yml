@@ -7,4 +7,12 @@ batching:
     used_methods: edges
 training:
   encoder:
-    used_methods: none # uses only a linear layer
+    used_methods: linear_edge_feat # uses separate feature branch
+construction:
+  fuse_edge: False
+edge_engineering:
+  enabled: True
+  features: "fan_out_in, burstiness, op_rarity, pair_recurrence, type_entropy"
+  ema_alpha: 0.1
+  normalize_counts: True
+  standardize_time: True

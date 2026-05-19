@@ -12,6 +12,8 @@ from pidsmaker.featurization.feat_inference_methods import (
     feat_inference_TRW,
     feat_inference_word2vec,
 )
+import math
+from collections import defaultdict
 from pidsmaker.utils.data_utils import CollatableTemporalData
 from pidsmaker.utils.dataset_utils import get_node_map, get_rel2id
 from pidsmaker.utils.utils import (
@@ -26,6 +28,18 @@ def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg):
     for path in log_tqdm(sorted_paths, desc="Computing edge embeddings"):
         graph = torch.load(path)
         sorted_edges = graph.edges(data=True, keys=True)
+        
+        ee_enabled = getattr(cfg, "edge_engineering", False) and getattr(cfg.edge_engineering, "enabled", False)
+        if ee_enabled:
+            ema_alpha = cfg.edge_engineering.ema_alpha
+            node_dst_fanin = defaultdict(set)
+            node_src_fanout = defaultdict(set)
+            pair_recurrence = defaultdict(int)
+            src_op_counts = defaultdict(lambda: defaultdict(int))
+            src_last_time = defaultdict(lambda: None)
+            pair_last_time = defaultdict(lambda: None)
+            src_burst_ema = defaultdict(float)
+            eng_feats = []
 
         src, dst, msg, t, y = [], [], [], [], []
         for u, v, k, attr in sorted_edges:
@@ -67,6 +81,56 @@ def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg):
                     )
                 )
 
+            if ee_enabled:
+                pair = (int(u), int(v))
+                pair_rec = pair_recurrence[pair]
+                pair_recurrence[pair] += 1
+                
+                src_fanout = len(node_src_fanout[int(u)])
+                dst_fanin = len(node_dst_fanin[int(v)])
+                node_src_fanout[int(u)].add(int(v))
+                node_dst_fanin[int(v)].add(int(u))
+                
+                op = attr.get("label", None)
+                total_ops = sum(src_op_counts[int(u)].values())
+                op_freq = src_op_counts[int(u)][op] if op is not None else 0
+                op_rarity = op_freq / total_ops if total_ops > 0 else 0.0
+                
+                entropy = 0.0
+                if total_ops > 0:
+                    for count in src_op_counts[int(u)].values():
+                        p = count / total_ops
+                        entropy -= p * math.log2(p)
+                        
+                if op is not None:
+                    src_op_counts[int(u)][op] += 1
+                    
+                curr_t = int(attr["time"])
+                dt_src = curr_t - src_last_time[int(u)] if src_last_time[int(u)] is not None else 0
+                dt_pair = curr_t - pair_last_time[pair] if pair_last_time[pair] is not None else 0
+                
+                src_last_time[int(u)] = curr_t
+                pair_last_time[pair] = curr_t
+                
+                if dt_src > 0:
+                    src_burst_ema[int(u)] = ema_alpha * dt_src + (1 - ema_alpha) * src_burst_ema[int(u)]
+                ema_val = src_burst_ema[int(u)]
+                
+                feats = [pair_rec, src_fanout, dst_fanin, op_rarity, entropy, dt_src, dt_pair, ema_val]
+                
+                if getattr(cfg.edge_engineering, "normalize_counts", False):
+                    feats[0] = math.log1p(feats[0])
+                    feats[1] = math.log1p(feats[1])
+                    feats[2] = math.log1p(feats[2])
+                    
+                eng_feats.append(feats)
+
+        if ee_enabled:
+            eng_tensor = torch.tensor(eng_feats, dtype=torch.float)
+            if getattr(cfg.edge_engineering, "standardize_time", False) and eng_tensor.shape[0] > 0:
+                max_t = eng_tensor[:, 5:8].max(dim=0, keepdim=True)[0] + 1e-6
+                eng_tensor[:, 5:8] /= max_t
+
         data = CollatableTemporalData(
             src=torch.tensor(src).to(torch.long),
             dst=torch.tensor(dst).to(torch.long),
@@ -74,6 +138,8 @@ def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg):
             msg=torch.vstack(msg).to(torch.float),
             y=torch.tensor(y).to(torch.long),
         )
+        if ee_enabled and eng_tensor.shape[0] > 0:
+            data.engineered_feats = eng_tensor
 
         os.makedirs(out_dir, exist_ok=True)
         file = path.split("/")[-1]

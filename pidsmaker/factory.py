@@ -223,6 +223,8 @@ def encoder_factory(cfg, msg_dim, in_dim, device, max_node_num, graph_reindexer)
         # MLP encoders
         elif method == "none":
             encoder = LinearEncoder(in_dim, node_out_dim)
+        elif method == "linear_edge_feat":
+            encoder = LinearEdgeFeatEncoder(in_dim, node_out_dim, edge_feat_dim=8, dropout=dropout)
         elif method == "custom_mlp":
             encoder = CustomMLPEncoder(
                 in_dim=in_dim,
