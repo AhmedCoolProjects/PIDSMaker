@@ -147,11 +147,15 @@ def compute_and_save_split2nodes(cfg):
     split_to_files = get_split_to_files(cfg, cfg.construction._graphs_dir)
     split2nodes = defaultdict(set)
 
+    # Stream one graph at a time. The previous list-comprehension form held
+    # every NetworkX MultiDiGraph for a split in RAM simultaneously, which
+    # is multi-GB-per-split on large datasets and produced spikes during a
+    # step that only needs the node id sets.
     for split, files in split_to_files.items():
-        graph_list = [torch.load(path) for path in files]
-        for G in log_tqdm(graph_list, desc=f"Check nodes in {split} set"):
-            for node in G.nodes():
-                split2nodes[split].add(node)
+        for path in log_tqdm(files, desc=f"Check nodes in {split} set"):
+            G = torch.load(path)
+            split2nodes[split].update(G.nodes())
+            del G
     split2nodes = dict(split2nodes)
 
     out_dir = cfg.construction._dicts_dir
