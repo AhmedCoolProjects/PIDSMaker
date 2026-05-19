@@ -73,3 +73,22 @@ Format for each entry:
 
 **Agent action (1–3 lines):** Dumped diff + cat'd new files, answered (a) bitwise-identical caveat (No, technically — `velox.yml` now also overrides `construction.fuse_edge: False`; with that *and* the two flags reverted, yes), (b) walked through 14 dims, (c) pointed at `builder = EdgeFeatureBuilder(...)` inside the per-path loop.
 ---
+
+---
+### [2026-05-19 00:00] — Commit and push v0.1 to fe_edge-claude
+**Prompt:**
+> Commit your changes to YOUR branch only (fe_edge-<your-name>). Do NOT merge or push to fe_edge.
+>
+> git add -A
+> git commit -m "v0.1 engineered edge features (draft for ablation)"
+> git push origin HEAD
+>
+> Then append this prompt to prompts.md and commit+push that too as a second commit:
+> git add prompts.md
+> git commit -m "log: commit prompt"
+> git push origin HEAD
+>
+> Confirm with `git log --oneline -3` and `git status`.
+
+**Agent action (1–3 lines):** Verified branch is fe_edge-claude (not fe_edge); staged all changes and made commit 1 ("v0.1 engineered edge features (draft for ablation)") with Co-Authored-By trailer; pushed to origin/fe_edge-claude; appended this prompt and made commit 2 ("log: commit prompt"); pushed.
+---
