@@ -98,10 +98,14 @@ def main(cfg):
             model.to_fine_tuning(False)
 
             loss_acc = torch.zeros(1, device=device)
-            tot_loss = 0
+            # Accumulate loss on-device; .item() once at epoch end. The
+            # previous tot_loss += loss.item() forced a CUDA sync after
+            # every batch, which made tiny-batch training GPU-idle on the
+            # A100 even though kernels were available.
+            tot_loss_t = torch.zeros(1, device=device)
             for dataset in train_data:
                 for i, g in enumerate(log_tqdm(dataset, "Training")):
-                    g.to(device=device)
+                    g.to(device=device, non_blocking=True)
                     g = remove_attacks_if_needed(g, cfg)
                     model.train()
                     optimizer.zero_grad()
@@ -109,22 +113,25 @@ def main(cfg):
                     results = model(g)
                     loss = results["loss"]
                     loss_acc += loss
-                    tot_loss += loss.item()
+                    tot_loss_t += loss.detach()
 
                     if (i + 1) % grad_acc == 0:
                         loss_acc.backward()
                         optimizer.step()
                         loss_acc = torch.zeros(1, device=device)
 
+                    # Move batch back to CPU so its GPU tensors are reclaimed
+                    # by the caching allocator. Do NOT call empty_cache() per
+                    # batch — that returns memory to the driver and forces the
+                    # next allocation to hit cudaMalloc, stalling the GPU.
                     g.to("cpu")
-                    if use_cuda:
-                        torch.cuda.empty_cache()
 
                 # Last batch
                 if loss_acc > 0:
                     loss_acc.backward()
                     optimizer.step()
 
+            tot_loss = float(tot_loss_t.item())
             tot_loss /= sum(len(dataset) for dataset in train_data)
             epoch_times.append(timer() - start)
 
@@ -157,18 +164,18 @@ def main(cfg):
                 model.reset_state()
 
                 loss_acc = torch.zeros(1, device=device)
-                tot_loss = 0
+                tot_loss_t = torch.zeros(1, device=device)
                 for dataset in train_data:
                     for g in log_tqdm(dataset, "Fine-tuning"):
                         if 1 in g.y:
-                            g.to(device=device)
+                            g.to(device=device, non_blocking=True)
                             model.train()
                             optimizer.zero_grad()
 
                             results = model(g)
                             loss = results["loss"]
                             loss_acc += loss
-                            tot_loss += loss.item()
+                            tot_loss_t += loss.detach()
 
                             if (i + 1) % grad_acc == 0:
                                 loss_acc.backward()
@@ -176,14 +183,13 @@ def main(cfg):
                                 loss_acc = torch.zeros(1, device=device)
 
                             g.to("cpu")
-                            if use_cuda:
-                                torch.cuda.empty_cache()
 
                     # Last batch
                     if loss_acc > 0:
                         loss_acc.backward()
                         optimizer.step()
 
+                tot_loss = float(tot_loss_t.item())
                 tot_loss /= sum(len(dataset) for dataset in train_data)
 
                 # Validation
