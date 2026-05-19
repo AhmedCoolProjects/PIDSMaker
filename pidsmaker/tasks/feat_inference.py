@@ -12,6 +12,7 @@ from pidsmaker.featurization.feat_inference_methods import (
     feat_inference_TRW,
     feat_inference_word2vec,
 )
+from pidsmaker.tasks.engineered_feats import EngineeredFeatureComputer
 from pidsmaker.utils.data_utils import CollatableTemporalData
 from pidsmaker.utils.dataset_utils import get_node_map, get_rel2id
 from pidsmaker.utils.utils import (
@@ -23,11 +24,38 @@ from pidsmaker.utils.utils import (
 
 
 def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg):
+    edge_engineering_enabled = getattr(cfg.batching, "edge_engineering", None) and cfg.batching.edge_engineering.enabled
+
     for path in log_tqdm(sorted_paths, desc="Computing edge embeddings"):
         graph = torch.load(path)
         sorted_edges = graph.edges(data=True, keys=True)
 
         src, dst, msg, t, y = [], [], [], [], []
+        engineered_feats_list = []
+        computer = None
+        op2id = None
+
+        if edge_engineering_enabled:
+            eng_cfg = cfg.batching.edge_engineering
+            num_op_types = len(etype2oh)
+            ema_alpha = eng_cfg.ema_alpha
+            use_log1p = eng_cfg.normalization.strip() == "log1p"
+            families = eng_cfg.feature_families
+            enabled = set()
+            for name, enabled_flag in [
+                ("pair_recurrence", families.pair_recurrence),
+                ("source_fanout", families.source_fanout),
+                ("dst_fanin", families.dst_fanin),
+                ("op_rarity", families.op_rarity),
+                ("temporal", families.temporal),
+                ("burstiness", families.burstiness),
+                ("entropy", families.entropy),
+            ]:
+                if enabled_flag:
+                    enabled.add(name)
+            computer = EngineeredFeatureComputer(num_op_types, ema_alpha, use_log1p, enabled)
+            op2id = {op: oh.argmax().item() for op, oh in etype2oh.items()}
+
         for u, v, k, attr in sorted_edges:
             src.append(int(u))
             dst.append(int(v))
@@ -40,6 +68,16 @@ def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg):
                 edge_label = etype2oh[attr["label"]]
             else:
                 edge_label = torch.zeros_like(etype2oh[list(etype2oh.keys())[0]])
+
+            if computer is not None and op2id is not None:
+                op_type_idx = op2id.get(attr.get("label"), 0)
+                eng_feat = computer.step(
+                    src=int(u),
+                    dst=int(v),
+                    op_type=op_type_idx,
+                    timestamp_ns=int(attr["time"]),
+                )
+                engineered_feats_list.append(eng_feat)
 
             # Only types
             if indexid2vec is None:
@@ -67,12 +105,19 @@ def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg):
                     )
                 )
 
+        extra_kwargs = {}
+        if engineered_feats_list:
+            extra_kwargs["engineered_feats"] = (
+                torch.stack(engineered_feats_list).to(torch.float)
+            )
+
         data = CollatableTemporalData(
             src=torch.tensor(src).to(torch.long),
             dst=torch.tensor(dst).to(torch.long),
             t=torch.tensor(t).to(torch.long),
             msg=torch.vstack(msg).to(torch.float),
             y=torch.tensor(y).to(torch.long),
+            **extra_kwargs,
         )
 
         os.makedirs(out_dir, exist_ok=True)

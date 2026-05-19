@@ -1,10 +1,25 @@
 # Simply the same config as orthrus_non_snooped + encoder set to none
+# + edge engineering enabled
 
 _include_yml: orthrus_non_snooped
 
 batching:
   intra_graph_batching:
     used_methods: edges
+  edge_features: edge_type,engineered
+  edge_engineering:
+    enabled: true
+    feature_families:
+      pair_recurrence: true
+      source_fanout: true
+      dst_fanin: true
+      op_rarity: true
+      temporal: true
+      burstiness: true
+      entropy: true
+    normalization: log1p
+    ema_alpha: 0.05
+
 training:
   encoder:
-    used_methods: none # uses only a linear layer
+    used_methods: linear_edge_feat # replaces `none`

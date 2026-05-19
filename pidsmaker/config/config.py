@@ -644,6 +644,7 @@ ENCODERS_CFG = {
         "architecture_str": Arg(str),
     },
     "none": {},
+    "linear_edge_feat": {},
 }
 
 DECODERS_NODE_LEVEL = ["node_mlp", "none", "magic_gat", "nodlink"]
@@ -868,11 +869,51 @@ TASK_ARGS = {
         ),
         "edge_features": Arg(
             str,
-            vals=AND(["edge_type", "edge_type_triplet", "msg", "time_encoding", "none"]),
+            vals=AND(["edge_type", "edge_type_triplet", "msg", "time_encoding", "engineered", "none"]),
             desc="Edge features to used during GNN training. `edge_type` refers to the system call type, `edge_type_triplet` \
                                 considers a same edge type as a new type if source or destination node types are different, `msg` is the message vector \
-                                used in the TGN, `time_encoding` encodes temporal order of events with their timestamps in the TGN, `none` uses no features.",
+                                used in the TGN, `time_encoding` encodes temporal order of events with their timestamps in the TGN, \
+                                `engineered` adds rolling-window statistical features (pair recurrence, fan-out, op rarity, temporal, burstiness, entropy), \
+                                `none` uses no features.",
         ),
+        "edge_engineering": {
+            "enabled": Arg(
+                bool,
+                desc="Master toggle for engineered edge features.",
+            ),
+            "feature_families": {
+                "pair_recurrence": Arg(
+                    bool, desc="Count of prior (src, dst) pairs in window."
+                ),
+                "source_fanout": Arg(
+                    bool, desc="Unique dst count seen per src."
+                ),
+                "dst_fanin": Arg(
+                    bool, desc="Unique src count seen per dst."
+                ),
+                "op_rarity": Arg(
+                    bool, desc="Per-src and global frequency of this op type."
+                ),
+                "temporal": Arg(
+                    bool, desc="Time since src's last edge and pair's last edge."
+                ),
+                "burstiness": Arg(
+                    bool, desc="EMA of src edge rate."
+                ),
+                "entropy": Arg(
+                    bool, desc="Shannon entropy of src's op distribution."
+                ),
+            },
+            "normalization": Arg(
+                str,
+                vals=AND(["log1p", "none"]),
+                desc="Normalization applied to count-based features. `log1p` applies ``log(1+x)``, `none` leaves raw.",
+            ),
+            "ema_alpha": Arg(
+                float,
+                desc="Exponential moving average decay factor for burstiness feature.",
+            ),
+        },
         "multi_dataset_training": Arg(
             bool, desc="Whether the GNN should be trained on all datasets in `multi_dataset`."
         ),
