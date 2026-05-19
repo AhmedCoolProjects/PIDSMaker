@@ -12,6 +12,7 @@ from pidsmaker.config import decoder_matches_objective
 from pidsmaker.decoders import *
 from pidsmaker.encoders import *
 from pidsmaker.experiments.uncertainty import add_dropout_to_model
+from pidsmaker.featurization.utils.edge_engineering import get_engineered_feat_dim
 from pidsmaker.losses import *
 from pidsmaker.model import Model
 from pidsmaker.objectives import *
@@ -223,6 +224,15 @@ def encoder_factory(cfg, msg_dim, in_dim, device, max_node_num, graph_reindexer)
         # MLP encoders
         elif method == "none":
             encoder = LinearEncoder(in_dim, node_out_dim)
+        elif method == "linear_edge_feats":
+            encoder = LinearEdgeFeatEncoder(
+                in_dim=in_dim,
+                edge_dim=edge_dim,
+                out_dim=node_out_dim,
+                dropout=dropout,
+                use_gating=cfg.training.encoder.linear_edge_feats.use_gating,
+                use_layer_norm=cfg.training.encoder.linear_edge_feats.use_layer_norm,
+            )
         elif method == "custom_mlp":
             encoder = CustomMLPEncoder(
                 in_dim=in_dim,
@@ -744,6 +754,8 @@ def get_edge_dim(cfg, msg_dim):
             if not use_tgn:
                 raise TypeError("Edge feature `time_encoding` is only available if TGN is used.")
             edge_dim += tgn_memory_dim
+        elif edge_feat == "engineered":
+            edge_dim += get_engineered_feat_dim(cfg)
         elif edge_feat == "none":
             pass
         else:

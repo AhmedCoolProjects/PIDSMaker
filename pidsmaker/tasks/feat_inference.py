@@ -12,6 +12,10 @@ from pidsmaker.featurization.feat_inference_methods import (
     feat_inference_TRW,
     feat_inference_word2vec,
 )
+from pidsmaker.featurization.utils.edge_engineering import (
+    compute_engineered_feats_for_edges,
+    edge_engineering_enabled,
+)
 from pidsmaker.utils.data_utils import CollatableTemporalData
 from pidsmaker.utils.dataset_utils import get_node_map, get_rel2id
 from pidsmaker.utils.utils import (
@@ -22,10 +26,25 @@ from pidsmaker.utils.utils import (
 )
 
 
-def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg):
+def feat_inference(indexid2vec, etype2oh, ntype2oh, rel2id, sorted_paths, out_dir, cfg):
     for path in log_tqdm(sorted_paths, desc="Computing edge embeddings"):
         graph = torch.load(path)
-        sorted_edges = graph.edges(data=True, keys=True)
+        sorted_edges = list(graph.edges(data=True, keys=True))
+
+        if edge_engineering_enabled(cfg) and cfg.construction.fuse_edge:
+            has_fusion_mapping = (
+                hasattr(graph, "raw_edges")
+                or hasattr(graph, "fusion_idxs")
+                or ("raw_edges" in getattr(graph, "graph", {}))
+                or ("fusion_idxs" in getattr(graph, "graph", {}))
+            )
+            if not has_fusion_mapping:
+                raise ValueError(
+                    "edge_engineering requires pre-fusion mapping (raw_edges/fusion_idxs) when fuse_edge=True. "
+                    "For v0.1 use fuse_edge=False."
+                )
+
+        engineered_feats = compute_engineered_feats_for_edges(cfg, rel2id, sorted_edges)
 
         src, dst, msg, t, y = [], [], [], [], []
         for u, v, k, attr in sorted_edges:
@@ -67,13 +86,17 @@ def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg):
                     )
                 )
 
-        data = CollatableTemporalData(
-            src=torch.tensor(src).to(torch.long),
-            dst=torch.tensor(dst).to(torch.long),
-            t=torch.tensor(t).to(torch.long),
-            msg=torch.vstack(msg).to(torch.float),
-            y=torch.tensor(y).to(torch.long),
-        )
+        collatable_kwargs = {
+            "src": torch.tensor(src).to(torch.long),
+            "dst": torch.tensor(dst).to(torch.long),
+            "t": torch.tensor(t).to(torch.long),
+            "msg": torch.vstack(msg).to(torch.float),
+            "y": torch.tensor(y).to(torch.long),
+        }
+        if engineered_feats is not None:
+            collatable_kwargs["engineered_feats"] = engineered_feats.to(torch.float)
+
+        data = CollatableTemporalData(**collatable_kwargs)
 
         os.makedirs(out_dir, exist_ok=True)
         file = path.split("/")[-1]
@@ -120,6 +143,7 @@ def main_from_config(cfg):
             indexid2vec=indexid2vec,
             etype2oh=etype2onehot,
             ntype2oh=ntype2onehot,
+            rel2id=rel2id,
             sorted_paths=sorted_paths,
             out_dir=os.path.join(cfg.feat_inference._edge_embeds_dir, f"{split}/"),
             cfg=cfg,

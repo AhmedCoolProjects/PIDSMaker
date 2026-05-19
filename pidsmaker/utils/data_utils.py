@@ -31,8 +31,8 @@ from pidsmaker.tgn import LastNeighborLoader
 from pidsmaker.utils.dataset_utils import (
     get_node_map,
     get_num_edge_type,
-    get_rel2id,
     get_possible_events,
+    get_rel2id,
 )
 from pidsmaker.utils.utils import get_multi_datasets, log_dataset_stats, log_tqdm
 
@@ -234,6 +234,9 @@ def extract_msg_from_data(
             fields[field] = g.msg[:, idx : idx + size]
             idx += size
 
+        if hasattr(g, "engineered_feats"):
+            fields["engineered_feats"] = g.engineered_feats
+
         # Selects only the node features we want
         x_src, x_dst = [], []
         for feat in selected_node_feats:
@@ -307,6 +310,7 @@ def extract_msg_from_data(
 
     return data_set
 
+
 def get_possible_triplets(cfg):
     entity_map = get_node_map(from_zero=True)
     event_map = get_rel2id(cfg, from_zero=True)
@@ -344,6 +348,12 @@ def build_edge_feats(fields, msg, edge_features, possible_triplets, num_edge_typ
         edge_feats.append(triplets)
     if "msg" in edge_features:
         edge_feats.append(msg)
+    if "engineered" in edge_features:
+        if "engineered_feats" not in fields:
+            raise ValueError(
+                "Requested edge feature `engineered` but `engineered_feats` is missing in graph data."
+            )
+        edge_feats.append(fields["engineered_feats"])
     edge_feats = torch.cat(edge_feats, dim=-1) if len(edge_feats) > 0 else None
     return edge_feats
 

@@ -1,10 +1,42 @@
-# Simply the same config as orthrus_non_snooped + encoder set to none
+# VELOX baseline + causal engineered edge features
 
 _include_yml: orthrus_non_snooped
 
+construction:
+  # v0.1 decision: fusion mapping is not available (no raw_edges/fusion_idxs path in graphs)
+  # so engineered features are run with fuse_edge disabled.
+  fuse_edge: False
+
+feat_inference:
+  edge_engineering:
+    enable: True
+    log1p_counts: True
+    delta_time_unit: seconds
+    eps: 0.000001
+    pair_recurrence:
+      enabled: True
+    fan:
+      enabled: True
+    operation_rarity:
+      enabled: True
+    temporal:
+      enabled: True
+      standardize_delta_t: True
+    burstiness:
+      enabled: True
+      ema_alpha: 0.2
+    op_mix:
+      enabled: True
+
 batching:
+  edge_features: edge_type,engineered
   intra_graph_batching:
     used_methods: edges
+
 training:
   encoder:
-    used_methods: none # uses only a linear layer
+    used_methods: linear_edge_feats
+    x_is_tuple: False
+    linear_edge_feats:
+      use_gating: True
+      use_layer_norm: True

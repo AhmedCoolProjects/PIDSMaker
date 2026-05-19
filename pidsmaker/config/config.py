@@ -415,16 +415,9 @@ DATASET_DEFAULT_CONFIG = {
             # Arbitrarly picked 2022-07-17 for the validation/threshold calibration
             "2022-07-18",
         ],
-        "val_dates": [
-            "2022-07-17"
-        ],
-        "test_dates": [
-            "2022-07-19",
-            "2022-07-20"
-        ],
-        "unused_dates": [
-            "2022-07-15"
-        ],
+        "val_dates": ["2022-07-17"],
+        "test_dates": ["2022-07-19", "2022-07-20"],
+        "unused_dates": ["2022-07-15"],
         "ground_truth_relative_path": [
             "atlasv2_edr/atlasv2_edr_s1.csv",
             "atlasv2_edr/atlasv2_edr_s2.csv",
@@ -643,6 +636,10 @@ ENCODERS_CFG = {
     "custom_mlp": {
         "architecture_str": Arg(str),
     },
+    "linear_edge_feats": {
+        "use_gating": Arg(bool),
+        "use_layer_norm": Arg(bool),
+    },
     "none": {},
 }
 
@@ -852,6 +849,32 @@ TASK_ARGS = {
     },
     "feat_inference": {
         "to_remove": Arg(bool),  # TODO: remove
+        "edge_engineering": {
+            "enable": Arg(bool),
+            "log1p_counts": Arg(bool),
+            "delta_time_unit": Arg(str, vals=OR(["seconds", "milliseconds"])),
+            "eps": Arg(float),
+            "pair_recurrence": {
+                "enabled": Arg(bool),
+            },
+            "fan": {
+                "enabled": Arg(bool),
+            },
+            "operation_rarity": {
+                "enabled": Arg(bool),
+            },
+            "temporal": {
+                "enabled": Arg(bool),
+                "standardize_delta_t": Arg(bool),
+            },
+            "burstiness": {
+                "enabled": Arg(bool),
+                "ema_alpha": Arg(float),
+            },
+            "op_mix": {
+                "enabled": Arg(bool),
+            },
+        },
     },
     "batching": {
         "save_on_disk": Arg(
@@ -868,10 +891,13 @@ TASK_ARGS = {
         ),
         "edge_features": Arg(
             str,
-            vals=AND(["edge_type", "edge_type_triplet", "msg", "time_encoding", "none"]),
+            vals=AND(
+                ["edge_type", "edge_type_triplet", "msg", "time_encoding", "engineered", "none"]
+            ),
             desc="Edge features to used during GNN training. `edge_type` refers to the system call type, `edge_type_triplet` \
                                 considers a same edge type as a new type if source or destination node types are different, `msg` is the message vector \
-                                used in the TGN, `time_encoding` encodes temporal order of events with their timestamps in the TGN, `none` uses no features.",
+                                used in the TGN, `time_encoding` encodes temporal order of events with their timestamps in the TGN, \
+                                `engineered` uses causal rolling-window behavioral features, `none` uses no features.",
         ),
         "multi_dataset_training": Arg(
             bool, desc="Whether the GNN should be trained on all datasets in `multi_dataset`."
