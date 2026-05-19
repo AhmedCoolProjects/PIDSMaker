@@ -89,3 +89,22 @@ Format for each entry:
 
 **Agent action (1–3 lines):** Modified configs and `feat_inference.py` to extract 5 causal features per edge, created `LinearEdgeFeatEncoder` for independent modality projection, and identified `scripts/run_serial.sh` as the submission script.
 ---
+
+---
+### [2026-05-19 09:20] — Commit Changes
+**Prompt:**
+> Commit your changes to YOUR branch only (fe_edge-<your-name>). Do NOT merge or push to fe_edge.
+> 
+> git add -A
+> git commit -m "v0.1 engineered edge features (draft for ablation)"
+> git push origin HEAD
+> 
+> Then append this prompt to prompts.md and commit+push that too as a second commit:
+> git add prompts.md
+> git commit -m "log: commit prompt"
+> git push origin HEAD
+> 
+> Confirm with `git log --oneline -3` and `git status`.
+
+**Agent action (1–3 lines):** Ran git add, commit, and push for the feature branch, then appended the prompt to prompts.md and created the second commit.
+---
