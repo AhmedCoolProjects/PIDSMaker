@@ -292,7 +292,10 @@ def main(cfg, model, val_data, test_data, epoch, split, logging=True):
         tracemalloc.start()
 
         all_losses = []
-        for graphs in dataset:
+        # Materialise the iterator once so a LazyTestData proxy loads its
+        # payload exactly once per evaluation (not on every nested access).
+        iterable = list(iter(dataset)) if hasattr(dataset, "_load") else dataset
+        for graphs in iterable:
             for g in log_tqdm(graphs, desc=desc, logging=logging):
                 g.to(device=device)
 
@@ -321,6 +324,12 @@ def main(cfg, model, val_data, test_data, epoch, split, logging=True):
             peak_inference_gpu_memory = torch.cuda.max_memory_allocated(device=device) / (1024**3)
             peak_inference_gpu_mem = max(peak_inference_gpu_mem, peak_inference_gpu_memory)
             torch.cuda.reset_peak_memory_stats(device=device)
+
+        # If the dataset was a LazyTestData proxy, drop its in-RAM cache now
+        # so the training loop doesn't carry it forward between evaluations.
+        del iterable
+        if hasattr(dataset, "release"):
+            dataset.release()
 
         mean_loss = np.mean(all_losses)
         split2loss[split_name] = mean_loss

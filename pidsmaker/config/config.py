@@ -859,6 +859,12 @@ TASK_ARGS = {
             desc="Whether to store the graphs on disk upon building the graphs. \
             Used to avoid re-computation of very complex batching operations that take time. Can take up to 300GB storage for CADETS_E5.",
         ),
+        "lazy_test_data": Arg(
+            bool,
+            desc="If True, after batching, test_data is serialized to disk and dropped \
+            from RAM until evaluation needs it. Cuts peak resident memory during \
+            training on huge datasets where test_data alone can be 50+GB.",
+        ),
         "node_features": Arg(
             str,
             vals=AND(["node_type", "node_emb", "only_ones", "edges_distribution"]),

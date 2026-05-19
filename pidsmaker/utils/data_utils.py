@@ -34,7 +34,48 @@ from pidsmaker.utils.dataset_utils import (
     get_rel2id,
     get_possible_events,
 )
-from pidsmaker.utils.utils import get_multi_datasets, log_dataset_stats, log_tqdm
+from pidsmaker.utils.utils import get_multi_datasets, log, log_dataset_stats, log_tqdm
+
+
+class LazyTestData:
+    """Disk-backed proxy for a fully-processed test_data structure.
+
+    `test_data` is a `list[list[CollatableTemporalData]]` (outer list = per
+    dataset group, inner list = batches). On huge datasets keeping it in
+    RAM through the entire training loop dwarfs the model itself. This
+    proxy serialises it once to disk, drops the in-RAM copy, and re-loads
+    it on iteration. Call `release()` after evaluation to free the cache.
+
+    Iteration semantics are identical to the underlying list, so callers
+    (inference_loop) need no changes.
+    """
+
+    def __init__(self, path):
+        self._path = path
+        self._cached = None
+
+    def _load(self):
+        if self._cached is None:
+            self._cached = torch.load(self._path, map_location="cpu")
+        return self._cached
+
+    def release(self):
+        """Drop the cached payload so subsequent iteration re-reads from disk."""
+        self._cached = None
+        gc.collect()
+
+    def __iter__(self):
+        return iter(self._load())
+
+    def __len__(self):
+        return len(self._load())
+
+    def __getitem__(self, i):
+        return self._load()[i]
+
+    def __bool__(self):
+        # Keep `if test_data:` checks working without forcing a load.
+        return True
 
 
 class CollatableTemporalData(TemporalData):
@@ -171,6 +212,20 @@ def load_all_datasets(cfg, device, only_keep=None):
     datasets = run_inter_graph_batching(datasets, cfg)
 
     train_data, val_data, test_data = datasets
+
+    # Optionally serialise test_data to disk so it can be dropped from RAM
+    # during the long training loop. Re-loaded on-demand by inference_loop
+    # via LazyTestData iteration semantics.
+    if getattr(cfg.batching, "lazy_test_data", None):
+        out_dir = cfg.batching._preprocessed_graphs_dir
+        os.makedirs(out_dir, exist_ok=True)
+        test_path = os.path.join(out_dir, "test_data.lazy.pkl")
+        log(f"[lazy_test_data] Saving test_data to {test_path} and freeing it from RAM.")
+        torch.save(test_data, test_path)
+        del test_data
+        gc.collect()
+        test_data = LazyTestData(test_path)
+
     return train_data, val_data, test_data, max_node
 
 
