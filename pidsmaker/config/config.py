@@ -874,6 +874,15 @@ TASK_ARGS = {
             edge stream — the single biggest contributor to >300GB resident \
             usage on TRACE_E5 / FIVEDIRECTIONS_E5. Requires fast local storage.",
         ),
+        "lazy_batches": Arg(
+            bool,
+            desc="If True, after all batching (compute_tgn_graphs / reindexing / \
+            inter-graph), each prepared batch is serialized to its own .pt file \
+            and the in-RAM list is replaced by a LazyBatchList that loads one \
+            batch at a time during training/eval. Cuts CPU RAM by the size of \
+            the precomputed *_tgn neighbor tensors (often 100-200GB for big \
+            TGN runs). Adds a small per-batch disk read; works best with NVMe.",
+        ),
         "node_features": Arg(
             str,
             vals=AND(["node_type", "node_emb", "only_ones", "edges_distribution"]),

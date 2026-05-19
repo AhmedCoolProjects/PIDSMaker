@@ -37,6 +37,76 @@ from pidsmaker.utils.dataset_utils import (
 from pidsmaker.utils.utils import get_multi_datasets, log, log_dataset_stats, log_tqdm
 
 
+class LazyBatchList:
+    """Disk-backed iterable replacing an in-RAM list of fully-prepared batches.
+
+    Each batch is serialized to its own ``.pt`` file under ``dir`` and named
+    ``batch_<idx:06d>.pt``. Iteration loads one batch at a time and yields
+    it; nothing is cached between accesses, so peak resident memory is
+    bounded by a single batch.
+
+    Designed as a drop-in replacement for the inner ``data_list`` of
+    ``train_data`` / ``val_data`` / ``test_data`` after all batching stages
+    have run. The training/inference loops never need to know whether they
+    are iterating an in-RAM list or one of these — same ``__iter__``,
+    ``__len__``, ``__getitem__`` semantics.
+    """
+
+    def __init__(self, directory, num_batches):
+        self._dir = directory
+        self._n = int(num_batches)
+
+    def __len__(self):
+        return self._n
+
+    def _path(self, idx):
+        return os.path.join(self._dir, f"batch_{idx:06d}.pt")
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            return [self[i] for i in range(*idx.indices(self._n))]
+        if idx < 0:
+            idx += self._n
+        if not 0 <= idx < self._n:
+            raise IndexError(idx)
+        return torch.load(self._path(idx), map_location="cpu")
+
+    def __iter__(self):
+        for i in range(self._n):
+            yield torch.load(self._path(i), map_location="cpu")
+
+    def __bool__(self):
+        return self._n > 0
+
+    @staticmethod
+    def from_list(batches, directory):
+        """Serialize each batch to its own file under ``directory`` and return
+        a proxy. The caller is responsible for releasing the original list
+        references after this returns.
+        """
+        os.makedirs(directory, exist_ok=True)
+        for i, b in enumerate(batches):
+            torch.save(b, os.path.join(directory, f"batch_{i:06d}.pt"))
+        return LazyBatchList(directory, len(batches))
+
+
+def _wrap_split_lazy(split, base_dir, split_name):
+    """Replace each inner batch list in a split with a LazyBatchList.
+
+    A split is ``list[list[batch]]`` — outer is the dataset group index
+    (always length 1 for single-dataset; longer for multi-dataset).
+    Returns the new outer list and frees the input as it goes so the
+    caller's RAM doesn't carry both copies.
+    """
+    out = []
+    for group_idx, data_list in enumerate(split):
+        group_dir = os.path.join(base_dir, split_name, f"group_{group_idx}")
+        out.append(LazyBatchList.from_list(data_list, group_dir))
+        # drop in-place so caller's `split` variable releases its refs as we go
+        split[group_idx] = None
+    return out
+
+
 class LazyTestData:
     """Disk-backed proxy for a fully-processed test_data structure.
 
@@ -215,10 +285,32 @@ def load_all_datasets(cfg, device, only_keep=None):
 
     train_data, val_data, test_data = datasets
 
+    # Optionally swap every prepared batch out to disk and replace the
+    # in-RAM lists with LazyBatchList proxies. After all batching stages
+    # the precomputed TGN neighbor tensors per batch (msg_tgn, t_tgn,
+    # x_from_tgn, x_to_tgn, x_tgn, node_type_tgn, edge_type_tgn, ...) live
+    # in CPU RAM for the entire training run — on TGN systems this is
+    # often 100-200GB. Lazy batches cut that to a single batch's worth.
+    if getattr(cfg.batching, "lazy_batches", None):
+        base_dir = os.path.join(cfg.batching._preprocessed_graphs_dir, "lazy_batches")
+        log(f"[lazy_batches] Serialising prepared batches to {base_dir}.")
+        train_data = _wrap_split_lazy(train_data, base_dir, "train")
+        gc.collect()
+        val_data = _wrap_split_lazy(val_data, base_dir, "val")
+        gc.collect()
+        test_data = _wrap_split_lazy(test_data, base_dir, "test")
+        gc.collect()
+        total_batches = sum(len(g) for split in (train_data, val_data, test_data) for g in split)
+        log(f"[lazy_batches] Wrote {total_batches} batch(es); replaced in-RAM lists.")
+
     # Optionally serialise test_data to disk so it can be dropped from RAM
     # during the long training loop. Re-loaded on-demand by inference_loop
     # via LazyTestData iteration semantics.
-    if getattr(cfg.batching, "lazy_test_data", None):
+    # NOTE: with lazy_batches on, test_data is already disk-backed per batch,
+    # so this extra step would just create a redundant full-split pickle.
+    if getattr(cfg.batching, "lazy_test_data", None) and not getattr(
+        cfg.batching, "lazy_batches", None
+    ):
         out_dir = cfg.batching._preprocessed_graphs_dir
         os.makedirs(out_dir, exist_ok=True)
         test_path = os.path.join(out_dir, "test_data.lazy.pkl")
