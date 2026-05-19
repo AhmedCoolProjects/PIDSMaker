@@ -184,21 +184,12 @@ def load_all_datasets(cfg, device, only_keep=None):
     else:
         full_data = None
 
-    # `full_data.msg` (when present) already holds everything `compute_tgn_graphs`
-    # needs via e_id-indexed slices. The per-graph wide `msg` tensors that fed
-    # into it are no longer required by any downstream step (encoders read the
-    # rebuilt narrow `msg` set in `extract_msg_from_data` only when TGN+memory
-    # is enabled). Free them now to halve the resident dataset size.
-    use_tgn_memory = (
-        "tgn" in cfg.training.encoder.used_methods and cfg.training.encoder.tgn.use_memory
-    )
-    if not use_tgn_memory:
-        for split in (train_data, val_data, test_data):
-            for dataset in split:
-                for g in dataset:
-                    if "msg" in g._store:
-                        del g.msg
-        gc.collect()
+    # NOTE: a previous version of this function tried to del `g.msg` whenever
+    # TGN memory was not in use. That is unsafe — `model.embed()` always
+    # passes `msg=batch.msg` to the encoder regardless of whether the encoder
+    # consumes it (the kwarg access itself raises AttributeError when the
+    # attribute is missing). Keep per-graph msg around; the real savings
+    # come from skipping it in `full_data` (above) and from `mmap_full_data`.
 
     graph_reindexer = GraphReindexer(
         device=device,
