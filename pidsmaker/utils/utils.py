@@ -165,6 +165,24 @@ def init_database_connection(cfg):
     return cur, connect
 
 
+def stream_query(connect, sql, itersize=10000, name="pidsmaker_stream"):
+    """Stream rows from Postgres using a server-side named cursor.
+
+    Avoids loading entire result sets into Python memory at once. The default
+    `itersize` (10k) controls the network/round-trip batch size; rows are
+    yielded one-by-one to the caller. The cursor is closed on exhaustion or
+    on exception.
+    """
+    server_cursor = connect.cursor(name=name)
+    server_cursor.itersize = itersize
+    try:
+        server_cursor.execute(sql)
+        for row in server_cursor:
+            yield row
+    finally:
+        server_cursor.close()
+
+
 def std(t):
     t = np.array(t)
     return np.std(t)

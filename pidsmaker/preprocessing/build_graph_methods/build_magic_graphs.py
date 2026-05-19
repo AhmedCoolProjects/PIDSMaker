@@ -13,10 +13,11 @@ from pidsmaker.utils.utils import (
     log,
     log_start,
     ns_time_to_datetime_US,
+    stream_query,
 )
 
 
-def get_node_list(cur, cfg):
+def get_node_list(cur, connect, cfg):
     use_hashed_label = cfg.construction.use_hashed_label
     node_label_features = get_darpa_tc_node_feats_from_cfg(cfg)
 
@@ -25,97 +26,68 @@ def get_node_list(cur, cfg):
     uuid2name = {}
     hash2uuid = {}
 
-    # netflow
-    sql = "select * from netflow_node_table;"
-    cur.execute(sql)
+    # netflow — node_uuid | hash_id | src_addr | src_port | dst_addr | dst_port | index_id
+    # Stream rows via a server-side cursor instead of the previous
+    # execute()+fetchmany() loop. The old form buffered the whole result set
+    # client-side; on E5-scale node tables that alone can be >50GB.
+    for i in stream_query(connect, "select * from netflow_node_table;", name="pids_magic_netflow"):
+        attrs = {
+            "type": "netflow",
+            "local_ip": str(i[2]),
+            "local_port": str(i[3]),
+            "remote_ip": str(i[4]),
+            "remote_port": str(i[5]),
+        }
+        node_uuid = str(i[0])
+        hash_id = str(i[1])
+        index_id = int(i[-1])
 
-    while True:
-        records = cur.fetchmany(1000)
-        if not records:
-            break
-        # node_uuid | hash_id | src_addr | src_port | dst_addr | dst_port | index_id
-        for i in records:
-            attrs = {
-                "type": "netflow",
-                "local_ip": str(i[2]),
-                "local_port": str(i[3]),
-                "remote_ip": str(i[4]),
-                "remote_port": str(i[5]),
-            }
-            node_uuid = str(i[0])
-            hash_id = str(i[1])
-            index_id = int(i[-1])
+        features_used = []
+        for label_used in node_label_features["netflow"]:
+            features_used.append(attrs[label_used])
+        label_str = " ".join(features_used)
 
-            features_used = []
-            for label_used in node_label_features["netflow"]:
-                features_used.append(attrs[label_used])
-            label_str = " ".join(features_used)
+        uuid2idx[node_uuid] = index_id
+        uuid2type[node_uuid] = attrs["type"]
+        uuid2name[node_uuid] = label_str
+        hash2uuid[hash_id] = node_uuid
 
-            uuid2idx[node_uuid] = index_id
-            uuid2type[node_uuid] = attrs["type"]
-            uuid2name[node_uuid] = label_str
-            hash2uuid[hash_id] = node_uuid
+    # subject — node_uuid | hash_id | path | cmd | index_id
+    for i in stream_query(connect, "select * from subject_node_table;", name="pids_magic_subject"):
+        attrs = {"type": "subject", "path": str(i[2]), "cmd_line": str(i[3])}
+        node_uuid = str(i[0])
+        hash_id = str(i[1])
+        index_id = int(i[-1])
+        features_used = []
+        for label_used in node_label_features["subject"]:
+            features_used.append(attrs[label_used])
+        label_str = " ".join(features_used)
 
-    del records
+        uuid2idx[node_uuid] = index_id
+        uuid2type[node_uuid] = attrs["type"]
+        uuid2name[node_uuid] = label_str
+        hash2uuid[hash_id] = node_uuid
 
-    # subject
-    sql = """
-    select * from subject_node_table;
-    """
-    cur.execute(sql)
-    while True:
-        records = cur.fetchmany(1000)
-        if not records:
-            break
-        # node_uuid | hash_id | path | cmd | index_id
-        for i in records:
-            attrs = {"type": "subject", "path": str(i[2]), "cmd_line": str(i[3])}
-            node_uuid = str(i[0])
-            hash_id = str(i[1])
-            index_id = int(i[-1])
-            features_used = []
-            for label_used in node_label_features["subject"]:
-                features_used.append(attrs[label_used])
-            label_str = " ".join(features_used)
+    # file — node_uuid | hash_id | path | index_id
+    for i in stream_query(connect, "select * from file_node_table;", name="pids_magic_file"):
+        attrs = {"type": "file", "path": str(i[2])}
+        node_uuid = str(i[0])
+        hash_id = str(i[1])
+        index_id = int(i[-1])
+        features_used = []
+        for label_used in node_label_features["file"]:
+            features_used.append(attrs[label_used])
+        label_str = " ".join(features_used)
 
-            uuid2idx[node_uuid] = index_id
-            uuid2type[node_uuid] = attrs["type"]
-            uuid2name[node_uuid] = label_str
-            hash2uuid[hash_id] = node_uuid
-
-    del records
-
-    # file
-    sql = """
-    select * from file_node_table;
-    """
-    cur.execute(sql)
-    while True:
-        records = cur.fetchmany(1000)
-        if not records:
-            break
-        # node_uuid | hash_id | path | index_id
-        for i in records:
-            attrs = {"type": "file", "path": str(i[2])}
-            node_uuid = str(i[0])
-            hash_id = str(i[1])
-            index_id = int(i[-1])
-            features_used = []
-            for label_used in node_label_features["file"]:
-                features_used.append(attrs[label_used])
-            label_str = " ".join(features_used)
-
-            uuid2idx[node_uuid] = index_id
-            uuid2type[node_uuid] = attrs["type"]
-            uuid2name[node_uuid] = label_str
-            hash2uuid[hash_id] = node_uuid
-
-    del records
+        uuid2idx[node_uuid] = index_id
+        uuid2type[node_uuid] = attrs["type"]
+        uuid2name[node_uuid] = label_str
+        hash2uuid[hash_id] = node_uuid
 
     return uuid2idx, uuid2type, uuid2name, hash2uuid
 
 
-def generate_graphs(cur, uuid2type, graph_out_dir, hash2uuid, cfg):
+def generate_graphs(cur, connect, uuid2type, graph_out_dir, hash2uuid, cfg):
     rel2id = get_rel2id(cfg)
     ntype2id = get_node_map()
     include_edge_type = rel2id
@@ -140,41 +112,22 @@ def generate_graphs(cur, uuid2type, graph_out_dir, hash2uuid, cfg):
             stop = timestamps[i + 1]
             start_ns_timestamp = datetime_to_ns_time_US(start)
             end_ns_timestamp = datetime_to_ns_time_US(stop)
-            sql = """
-            select * from event_table
-            where
-                  timestamp_rec>'%s' and timestamp_rec<'%s'
-                   ORDER BY timestamp_rec;
-            """ % (start_ns_timestamp, end_ns_timestamp)
-            cur.execute(sql)
-            events = cur.fetchall()
+            sql = (
+                "select * from event_table "
+                f"where timestamp_rec>'{start_ns_timestamp}' and timestamp_rec<'{end_ns_timestamp}' "
+                "ORDER BY timestamp_rec;"
+            )
 
-            if len(events) == 0:
+            # Stream rows from a server-side cursor so the entire day of events
+            # is not buffered client-side before filtering.
+            events_list = [
+                row
+                for row in stream_query(connect, sql, name="pids_magic_events")
+                if row[2] in include_edge_type
+            ]
+
+            if not events_list:
                 continue
-
-            events_list = []
-            for (
-                src_node,
-                src_index_id,
-                operation,
-                dst_node,
-                dst_index_id,
-                event_uuid,
-                timestamp_rec,
-                _id,
-            ) in events:
-                if operation in include_edge_type:
-                    event_tuple = (
-                        src_node,
-                        src_index_id,
-                        operation,
-                        dst_node,
-                        dst_index_id,
-                        event_uuid,
-                        timestamp_rec,
-                        _id,
-                    )
-                    events_list.append(event_tuple)
 
             start_time = events_list[0][-2]
             temp_list = []
@@ -251,7 +204,7 @@ def generate_graphs(cur, uuid2type, graph_out_dir, hash2uuid, cfg):
 def main(cfg):
     log_start(__file__)
     cur, connect = init_database_connection(cfg)
-    uuid2idx, uuid2type, uuid2name, hash2uuid = get_node_list(cur=cur, cfg=cfg)
+    uuid2idx, uuid2type, uuid2name, hash2uuid = get_node_list(cur=cur, connect=connect, cfg=cfg)
 
     os.makedirs(cfg.construction._magic_dir, exist_ok=True)
     os.makedirs(cfg.construction._magic_graphs_dir, exist_ok=True)
@@ -264,7 +217,12 @@ def main(cfg):
         json.dump(uuid2type, fw)
 
     generate_graphs(
-        cur=cur, uuid2type=uuid2type, graph_out_dir=graph_out_dir, hash2uuid=hash2uuid, cfg=cfg
+        cur=cur,
+        connect=connect,
+        uuid2type=uuid2type,
+        graph_out_dir=graph_out_dir,
+        hash2uuid=hash2uuid,
+        cfg=cfg,
     )
 
     del uuid2idx, uuid2type, uuid2name, hash2uuid
