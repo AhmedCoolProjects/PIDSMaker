@@ -223,6 +223,13 @@ def encoder_factory(cfg, msg_dim, in_dim, device, max_node_num, graph_reindexer)
         # MLP encoders
         elif method == "none":
             encoder = LinearEncoder(in_dim, node_out_dim)
+        elif method == "linear_edge_feat":
+            encoder = LinearEdgeFeatEncoder(
+                in_dim=in_dim,
+                edge_dim=edge_dim or 0,
+                out_dim=node_out_dim,
+                dropout=dropout,
+            )
         elif method == "custom_mlp":
             encoder = CustomMLPEncoder(
                 in_dim=in_dim,
@@ -744,6 +751,16 @@ def get_edge_dim(cfg, msg_dim):
             if not use_tgn:
                 raise TypeError("Edge feature `time_encoding` is only available if TGN is used.")
             edge_dim += tgn_memory_dim
+        elif edge_feat == "engineered":
+            from pidsmaker.featurization.edge_engineering import compute_engineered_dim
+
+            ee = getattr(cfg, "edge_engineering", None)
+            if ee is None or not getattr(ee, "enabled", False):
+                raise ValueError(
+                    "Edge feature 'engineered' is configured but "
+                    "`edge_engineering.enabled` is False."
+                )
+            edge_dim += compute_engineered_dim(ee.families, get_num_edge_type(cfg))
         elif edge_feat == "none":
             pass
         else:

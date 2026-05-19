@@ -1,10 +1,27 @@
-# Simply the same config as orthrus_non_snooped + encoder set to none
+# VELOX with rolling-window engineered edge features (v0.1).
+# Baseline: same config but with `edge_engineering.enabled: False`,
+# `batching.edge_features: edge_type`, and `training.encoder.used_methods: none`.
 
 _include_yml: orthrus_non_snooped
+
+construction:
+  # v0.1: no raw_edges / fusion_idxs mapping is produced by
+  # build_default_graphs.py, so we disable fusion to keep per-edge engineered
+  # features 1:1 with the saved edges. Fusion path is deferred to v0.2.
+  fuse_edge: False
 
 batching:
   intra_graph_batching:
     used_methods: edges
+  edge_features: edge_type, engineered
+
 training:
   encoder:
-    used_methods: none # uses only a linear layer
+    used_methods: linear_edge_feat
+
+edge_engineering:
+  enabled: True
+  families: pair_recurrence, src_fanout, dst_fanin, op_rarity, temporal, burstiness, type_mix_entropy
+  ema_alpha: 0.3
+  log1p_counts: True
+  standardize_delta_t: False

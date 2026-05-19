@@ -643,6 +643,7 @@ ENCODERS_CFG = {
     "custom_mlp": {
         "architecture_str": Arg(str),
     },
+    "linear_edge_feat": {},
     "none": {},
 }
 
@@ -853,6 +854,46 @@ TASK_ARGS = {
     "feat_inference": {
         "to_remove": Arg(bool),  # TODO: remove
     },
+    "edge_engineering": {
+        "enabled": Arg(
+            bool,
+            desc="Whether to compute rolling-window engineered edge features in feat_inference.",
+        ),
+        "families": Arg(
+            str,
+            vals=AND(
+                [
+                    "pair_recurrence",
+                    "src_fanout",
+                    "dst_fanin",
+                    "op_rarity",
+                    "temporal",
+                    "burstiness",
+                    "type_mix_entropy",
+                    "none",
+                ]
+            ),
+            desc="Comma-separated list of engineered feature families to compute. \
+                  `pair_recurrence` counts prior occurrences of the (src, dst) pair in the window, \
+                  `src_fanout` is |unique dsts touched by src|, `dst_fanin` is |unique srcs touching dst|, \
+                  `op_rarity` is per-(src, op) prior count + conditional frequency + novelty flag, \
+                  `temporal` is Δt since src's last edge and (src, dst)'s last edge (log1p, with has-prev flags), \
+                  `burstiness` is an EMA of src's edge rate plus its event count, \
+                  `type_mix_entropy` is normalized Shannon entropy of the src's op-type distribution.",
+        ),
+        "ema_alpha": Arg(
+            float,
+            desc="Smoothing factor for the per-src rate EMA used by `burstiness`. Higher = more recent-biased.",
+        ),
+        "log1p_counts": Arg(
+            bool,
+            desc="If True, apply log1p to count-based features (pair count, fan-out, fan-in, op count, event count).",
+        ),
+        "standardize_delta_t": Arg(
+            bool,
+            desc="If True, z-score the Δt columns of the `temporal` family per-window after emission.",
+        ),
+    },
     "batching": {
         "save_on_disk": Arg(
             bool,
@@ -868,10 +909,11 @@ TASK_ARGS = {
         ),
         "edge_features": Arg(
             str,
-            vals=AND(["edge_type", "edge_type_triplet", "msg", "time_encoding", "none"]),
+            vals=AND(["edge_type", "edge_type_triplet", "msg", "time_encoding", "engineered", "none"]),
             desc="Edge features to used during GNN training. `edge_type` refers to the system call type, `edge_type_triplet` \
                                 considers a same edge type as a new type if source or destination node types are different, `msg` is the message vector \
-                                used in the TGN, `time_encoding` encodes temporal order of events with their timestamps in the TGN, `none` uses no features.",
+                                used in the TGN, `time_encoding` encodes temporal order of events with their timestamps in the TGN, `engineered` are the \
+                                rolling-window behavioural features built by `edge_engineering` (pair recurrence, fan-out, etc.), `none` uses no features.",
         ),
         "multi_dataset_training": Arg(
             bool, desc="Whether the GNN should be trained on all datasets in `multi_dataset`."

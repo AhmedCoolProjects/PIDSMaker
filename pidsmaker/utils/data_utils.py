@@ -277,6 +277,11 @@ def extract_msg_from_data(
         else:
             msg = torch.cat([x_src, x_dst, fields["edge_type"]], dim=-1)
 
+        # Carry-through for engineered edge features (built in feat_inference).
+        engineered = getattr(g, "engineered_feats", None)
+        if engineered is not None:
+            fields["engineered_feats"] = engineered
+
         num_edge_types = get_num_edge_type(cfg)
         edge_feats = build_edge_feats(fields, msg, edge_features, possible_triplets, num_edge_types)
 
@@ -344,6 +349,15 @@ def build_edge_feats(fields, msg, edge_features, possible_triplets, num_edge_typ
         edge_feats.append(triplets)
     if "msg" in edge_features:
         edge_feats.append(msg)
+    if "engineered" in edge_features:
+        eng = fields.get("engineered_feats")
+        if eng is None:
+            raise ValueError(
+                "Edge feature 'engineered' is configured but no `engineered_feats` "
+                "tensor was found on the data. Run feat_inference with "
+                "`edge_engineering.enabled: True` to produce it."
+            )
+        edge_feats.append(eng)
     edge_feats = torch.cat(edge_feats, dim=-1) if len(edge_feats) > 0 else None
     return edge_feats
 

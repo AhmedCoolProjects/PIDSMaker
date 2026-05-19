@@ -54,6 +54,13 @@ featurization:
 feat_inference:
   to_remove: True
 
+edge_engineering:
+  enabled: False
+  families: pair_recurrence, src_fanout, dst_fanin, op_rarity, temporal, burstiness, type_mix_entropy
+  ema_alpha: 0.3
+  log1p_counts: True
+  standardize_delta_t: False
+
 training:
   encoder:
     x_is_tuple: False

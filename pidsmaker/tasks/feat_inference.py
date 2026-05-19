@@ -3,6 +3,7 @@ import os
 import torch
 
 from pidsmaker.config import update_cfg_for_multi_dataset
+from pidsmaker.featurization.edge_engineering import EdgeFeatureBuilder, parse_families
 from pidsmaker.featurization.feat_inference_methods import (
     feat_inference_alacarte,
     feat_inference_doc2vec,
@@ -13,7 +14,7 @@ from pidsmaker.featurization.feat_inference_methods import (
     feat_inference_word2vec,
 )
 from pidsmaker.utils.data_utils import CollatableTemporalData
-from pidsmaker.utils.dataset_utils import get_node_map, get_rel2id
+from pidsmaker.utils.dataset_utils import get_node_map, get_num_edge_type, get_rel2id
 from pidsmaker.utils.utils import (
     gen_relation_onehot,
     get_multi_datasets,
@@ -22,24 +23,51 @@ from pidsmaker.utils.utils import (
 )
 
 
-def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg):
+def _get_edge_engineering_cfg(cfg):
+    """Return (enabled, builder_kwargs) or (False, None)."""
+    ee = getattr(cfg, "edge_engineering", None)
+    if ee is None or not getattr(ee, "enabled", False):
+        return False, None
+    families = parse_families(ee.families)
+    if not families:
+        return False, None
+    return True, {
+        "num_op_types": get_num_edge_type(cfg),
+        "families": families,
+        "ema_alpha": ee.ema_alpha,
+        "log1p_counts": ee.log1p_counts,
+        "standardize_delta_t": ee.standardize_delta_t,
+    }
+
+
+def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg, rel2id=None):
+    ee_enabled, ee_kwargs = _get_edge_engineering_cfg(cfg)
+
     for path in log_tqdm(sorted_paths, desc="Computing edge embeddings"):
         graph = torch.load(path)
         sorted_edges = graph.edges(data=True, keys=True)
 
+        # Per-window builder: state resets on every graph (v0.1 design decision).
+        builder = EdgeFeatureBuilder(**ee_kwargs) if ee_enabled else None
+        engineered_rows = [] if ee_enabled else None
+
         src, dst, msg, t, y = [], [], [], [], []
         for u, v, k, attr in sorted_edges:
-            src.append(int(u))
-            dst.append(int(v))
-            t.append(int(attr["time"]))
+            u_int, v_int = int(u), int(v)
+            t_int = int(attr["time"])
+            src.append(u_int)
+            dst.append(v_int)
+            t.append(t_int)
             y.append(int(attr.get("y", 0)))
 
             # If the graph structure has been changed in transformation, we may loose
             # the edge label
             if "label" in attr:
                 edge_label = etype2oh[attr["label"]]
+                op_id = rel2id[attr["label"]] if rel2id is not None else None
             else:
                 edge_label = torch.zeros_like(etype2oh[list(etype2oh.keys())[0]])
+                op_id = None
 
             # Only types
             if indexid2vec is None:
@@ -67,12 +95,27 @@ def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg):
                     )
                 )
 
+            if ee_enabled:
+                engineered_rows.append(
+                    builder.emit_and_update(u_int, v_int, op_id, t_int)
+                )
+
+        kwargs = {}
+        if ee_enabled:
+            if engineered_rows:
+                eng_tensor = torch.tensor(engineered_rows, dtype=torch.float)
+            else:
+                eng_tensor = torch.zeros((0, builder.feat_dim), dtype=torch.float)
+            eng_tensor = builder.finalize(eng_tensor)
+            kwargs["engineered_feats"] = eng_tensor
+
         data = CollatableTemporalData(
             src=torch.tensor(src).to(torch.long),
             dst=torch.tensor(dst).to(torch.long),
             t=torch.tensor(t).to(torch.long),
             msg=torch.vstack(msg).to(torch.float),
             y=torch.tensor(y).to(torch.long),
+            **kwargs,
         )
 
         os.makedirs(out_dir, exist_ok=True)
@@ -123,6 +166,7 @@ def main_from_config(cfg):
             sorted_paths=sorted_paths,
             out_dir=os.path.join(cfg.feat_inference._edge_embeds_dir, f"{split}/"),
             cfg=cfg,
+            rel2id=rel2id,
         )
 
 
