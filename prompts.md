@@ -75,3 +75,22 @@ Format for each entry:
 
 **Agent action (1–3 lines):** Appended prompt, then collected `git diff --stat`, full `git diff`, and `cat` output for requested new files, followed by brief sanity answers.
 ---
+
+---
+### [2026-05-19 09:21] — User requested commit + push workflow and status confirmation
+**Prompt:**
+> Commit your changes to YOUR branch only (fe_edge-<your-name>). Do NOT merge or push to fe_edge.
+>
+> git add -A
+> git commit -m "v0.1 engineered edge features (draft for ablation)"
+> git push origin HEAD
+>
+> Then append this prompt to prompts.md and commit+push that too as a second commit:
+> git add prompts.md
+> git commit -m "log: commit prompt"
+> git push origin HEAD
+>
+> Confirm with `git log --oneline -3` and `git status`.
+
+**Agent action (1–3 lines):** Committed and pushed engineered-feature changes to the current branch, appended this prompt to `prompts.md`, then prepared a second log-only commit and push plus git log/status confirmation.
+---
