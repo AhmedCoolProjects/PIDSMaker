@@ -99,8 +99,9 @@ def feat_inference(indexid2vec, etype2oh, ntype2oh, sorted_paths, out_dir, cfg):
                 entropy = 0.0
                 if total_ops > 0:
                     for count in src_op_counts[int(u)].values():
-                        p = count / total_ops
-                        entropy -= p * math.log2(p)
+                        if count > 0:
+                            p = count / total_ops
+                            entropy -= p * math.log2(p)
                         
                 if op is not None:
                     src_op_counts[int(u)][op] += 1

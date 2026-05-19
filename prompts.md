@@ -108,3 +108,27 @@ Format for each entry:
 
 **Agent action (1–3 lines):** Ran git add, commit, and push for the feature branch, then appended the prompt to prompts.md and created the second commit.
 ---
+
+---
+### [2026-05-19 10:10] — Fix Math Domain Error
+**Prompt:**
+> The run failed in your feat_inference.py:
+> 
+>   File "pidsmaker/tasks/feat_inference.py", line 103, in feat_inference
+>     entropy -= p * math.log2(p)
+> ValueError: math domain error
+> 
+> You're computing Shannon entropy without guarding against p=0. log2(0) is undefined. Fix it with the standard guard:
+> 
+>   entropy -= p * math.log2(p) if p > 0 else 0
+> 
+> Or filter zero probabilities before the sum. Also double-check that your op-counts dict can never contain a zero entry that slips through.
+> 
+> Once fixed:
+> 1. Show me the diff for the fix.
+> 2. Do NOT commit. I'll pull and rerun.
+> 
+> Append this prompt to prompts.md.
+
+**Agent action (1–3 lines):** Added a `count > 0` condition before computing `p * math.log2(p)` in `feat_inference.py` to prevent math domain errors. Appended the prompt to the log.
+---
