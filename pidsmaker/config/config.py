@@ -865,6 +865,15 @@ TASK_ARGS = {
             from RAM until evaluation needs it. Cuts peak resident memory during \
             training on huge datasets where test_data alone can be 50+GB.",
         ),
+        "mmap_full_data": Arg(
+            bool,
+            desc="If True (and TGN last-neighbor batching is in use), build the \
+            global per-edge msg / t / edge_type / src / dst tensors incrementally \
+            on disk and access them via memory mapping. Avoids the in-RAM \
+            concatenation peak which is otherwise an extra copy of the entire \
+            edge stream — the single biggest contributor to >300GB resident \
+            usage on TRACE_E5 / FIVEDIRECTIONS_E5. Requires fast local storage.",
+        ),
         "node_features": Arg(
             str,
             vals=AND(["node_type", "node_emb", "only_ones", "edges_distribution"]),

@@ -162,13 +162,27 @@ def load_all_datasets(cfg, device, only_keep=None):
         test_data = test_data[:only_keep]
 
     # TGN's last-neighbor batching is the only consumer of the heavy fields
-    # (msg / t / edge_type) on `full_data`. Skipping them saves a full extra
-    # copy of the per-edge msg tensor (~half the in-RAM dataset) for every
-    # non-TGN system.
+    # (msg / t / edge_type) on `full_data`. For non-TGN paths we don't need
+    # full_data at all — max_node is streamed from per-graph tensors below.
     intra_methods = cfg.batching.intra_graph_batching.used_methods or ""
     use_tgn_last_neighbor = "tgn_last_neighbor" in intra_methods
-    full_keys = ["msg", "t", "edge_type", "src", "dst"] if use_tgn_last_neighbor else ["src", "dst"]
-    full_data = get_full_data([train_data, val_data, test_data], keys=full_keys)
+
+    # Compute max_node without building a full concatenated copy of src/dst.
+    max_node = compute_max_node([train_data, val_data, test_data])
+    print(f"Max node in {cfg.dataset.name}: {max_node}")
+
+    if use_tgn_last_neighbor:
+        full_keys = ["msg", "t", "edge_type", "src", "dst"]
+        if getattr(cfg.batching, "mmap_full_data", None):
+            mmap_dir = os.path.join(cfg.batching._preprocessed_graphs_dir, "full_data_mmap")
+            log(f"[mmap_full_data] Building disk-backed full_data at {mmap_dir}.")
+            full_data = build_full_data_mmap(
+                [train_data, val_data, test_data], keys=full_keys, out_dir=mmap_dir
+            )
+        else:
+            full_data = get_full_data([train_data, val_data, test_data], keys=full_keys)
+    else:
+        full_data = None
 
     # `full_data.msg` (when present) already holds everything `compute_tgn_graphs`
     # needs via e_id-indexed slices. The per-graph wide `msg` tensors that fed
@@ -185,9 +199,6 @@ def load_all_datasets(cfg, device, only_keep=None):
                     if "msg" in g._store:
                         del g.msg
         gc.collect()
-
-    max_node = torch.cat([full_data.src, full_data.dst]).max().item() + 1
-    print(f"Max node in {cfg.dataset.name}: {max_node}")
 
     graph_reindexer = GraphReindexer(
         device=device,
@@ -427,6 +438,100 @@ def build_edge_feats(fields, msg, edge_features, possible_triplets, num_edge_typ
         edge_feats.append(msg)
     edge_feats = torch.cat(edge_feats, dim=-1) if len(edge_feats) > 0 else None
     return edge_feats
+
+
+def compute_max_node(datasets):
+    """Stream max(src, dst) across every per-graph tensor.
+
+    Replaces ``torch.cat([full_data.src, full_data.dst]).max()`` which built
+    a full extra copy of every src/dst tensor just to find the max. Returns
+    ``max + 1`` so it matches the previous +1 convention.
+    """
+    max_node = -1
+    for dataset_group in datasets:
+        for dataset in dataset_group:
+            for data in dataset:
+                if data.src.numel():
+                    m = int(data.src.max().item())
+                    if m > max_node:
+                        max_node = m
+                if data.dst.numel():
+                    m = int(data.dst.max().item())
+                    if m > max_node:
+                        max_node = m
+    return max_node + 1
+
+
+def build_full_data_mmap(datasets, keys, out_dir):
+    """Concatenate per-graph attributes into disk-backed memory-mapped tensors.
+
+    Each key gets its own raw binary file written sequentially, one per-graph
+    slice at a time. Peak RAM is bounded by a single per-graph tensor — the
+    full concatenated copy never exists in memory. The returned ``Data``
+    exposes ``np.memmap``-backed torch tensors; indexing (e.g.
+    ``full_data.msg[e_id]``) pages in the requested rows on demand and the
+    gathered slice gets a new in-RAM allocation only for the gathered rows.
+
+    Uses numpy.memmap rather than torch.UntypedStorage.from_file so we stay
+    compatible with the torch 1.13 pin in this project's Dockerfile.
+    """
+    import numpy as np
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # First pass: collect dtype, tail shape, total length for every key.
+    sample_per_key = {}
+    total_E = 0
+    for dataset_group in datasets:
+        for dataset in dataset_group:
+            for data in dataset:
+                total_E += int(data.src.numel())
+                for k in keys:
+                    if k not in sample_per_key:
+                        sample_per_key[k] = getattr(data, k)
+
+    full_data = Data()
+    full_data._mmap_arrays = []  # keep numpy memmap refs alive
+
+    for k in keys:
+        sample = sample_per_key[k]
+        torch_dtype = sample.dtype
+        tail_shape = tuple(int(s) for s in sample.shape[1:])
+        path = os.path.join(out_dir, f"full_{k}.bin")
+
+        # Second pass: stream per-graph slices to disk. Each iteration touches
+        # one tensor at a time so peak extra RAM is bounded by the largest
+        # single per-graph tensor (not the full concatenation).
+        with open(path, "wb") as f:
+            for dataset_group in datasets:
+                for dataset in dataset_group:
+                    for data in dataset:
+                        t = getattr(data, k).contiguous()
+                        # `.numpy()` is zero-copy; tobytes copies once, then is
+                        # GC'd as the next iteration starts.
+                        f.write(t.numpy().tobytes())
+
+        # Read back as a memory-mapped numpy array, then wrap as a torch
+        # tensor. torch.from_numpy shares memory with the memmap, so element
+        # access pages in from disk; no full-in-RAM copy is made.
+        shape = (total_E,) + tail_shape if tail_shape else (total_E,)
+        np_dtype = {
+            torch.float32: np.float32,
+            torch.float64: np.float64,
+            torch.float16: np.float16,
+            torch.int64: np.int64,
+            torch.int32: np.int32,
+            torch.int16: np.int16,
+            torch.int8: np.int8,
+            torch.uint8: np.uint8,
+            torch.bool: np.bool_,
+        }[torch_dtype]
+        arr = np.memmap(path, dtype=np_dtype, mode="r", shape=shape)
+        full_data._mmap_arrays.append(arr)
+        setattr(full_data, k, torch.from_numpy(arr))
+
+    log(f"[mmap_full_data] Wrote {len(keys)} key(s) totalling {total_E} edges to {out_dir}.")
+    return full_data
 
 
 def get_full_data(datasets, keys=None):
