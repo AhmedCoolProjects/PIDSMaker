@@ -883,6 +883,15 @@ TASK_ARGS = {
             the precomputed *_tgn neighbor tensors (often 100-200GB for big \
             TGN runs). Adds a small per-batch disk read; works best with NVMe.",
         ),
+        "lazy_batches_fp16": Arg(
+            bool,
+            desc="When lazy_batches is on, save the large float tensors \
+            (msg, x_src, x_dst, x, x_from_tgn, x_to_tgn, x_tgn) as float16 on \
+            disk and upcast them to float32 on load. Halves on-disk size of the \
+            float payload for ~40% total reduction. Negligible precision impact \
+            for node/edge embedding values in [-1, 1] range. Model semantics \
+            unchanged at runtime (loads as float32).",
+        ),
         "node_features": Arg(
             str,
             vals=AND(["node_type", "node_emb", "only_ones", "edges_distribution"]),

@@ -37,6 +37,34 @@ from pidsmaker.utils.dataset_utils import (
 from pidsmaker.utils.utils import get_multi_datasets, log, log_dataset_stats, log_tqdm
 
 
+# Float tensors on each batch worth fp16-ing for the lazy_batches disk format.
+# Strictly the wide-d node/edge feature tensors — keep one-hot type vectors,
+# timestamps, indices, and edge_feats (often msg-like) at native precision.
+_LAZY_FP16_KEYS = (
+    "msg",
+    "x_src",
+    "x_dst",
+    "x",
+    "x_from_tgn",
+    "x_to_tgn",
+    "x_tgn",
+)
+
+
+def _cast_lazy_keys(batch, dtype):
+    """Cast each of the configured wide float tensors on ``batch`` to ``dtype``.
+
+    No-op on keys that don't exist on the batch or are already in ``dtype``.
+    Used to round-trip lazy-batch storage through a smaller on-disk dtype
+    (float16) while keeping the runtime / model side at float32.
+    """
+    for k in _LAZY_FP16_KEYS:
+        if k in batch._store:
+            t = batch._store[k]
+            if isinstance(t, torch.Tensor) and t.is_floating_point() and t.dtype != dtype:
+                batch._store[k] = t.to(dtype)
+
+
 class LazyBatchList:
     """Disk-backed iterable replacing an in-RAM list of fully-prepared batches.
 
@@ -58,12 +86,15 @@ class LazyBatchList:
     runs (msg_tgn alone is typically ~10MB/batch).
     """
 
-    def __init__(self, directory, num_batches, full_data=None):
+    def __init__(self, directory, num_batches, full_data=None, fp16=False):
         self._dir = directory
         self._n = int(num_batches)
         # Holding full_data here keeps the mmap-backed tensors alive for the
         # lifetime of this list, so `del full_data` upstream is harmless.
         self._full_data = full_data
+        # When True, the wide float tensors on disk are float16 and must be
+        # upcast to float32 after every load before yielding the batch.
+        self._fp16 = bool(fp16)
 
     def __len__(self):
         return self._n
@@ -72,14 +103,14 @@ class LazyBatchList:
         return os.path.join(self._dir, f"batch_{idx:06d}.pt")
 
     def _hydrate(self, batch):
-        """Re-attach TGN edge features from full_data using batch.e_id_tgn.
+        """Re-attach TGN edge features from full_data using batch.e_id_tgn,
+        and upcast fp16-on-disk wide floats back to float32.
 
-        No-op when ``self._full_data`` is None or the batch was saved with
-        msg_tgn / t_tgn / edge_type_tgn already on it.
+        No-op for fields not present or already at the expected dtype.
         """
-        if self._full_data is None:
-            return batch
-        if not hasattr(batch, "e_id_tgn"):
+        if self._fp16:
+            _cast_lazy_keys(batch, torch.float32)
+        if self._full_data is None or not hasattr(batch, "e_id_tgn"):
             return batch
         e_id = batch.e_id_tgn
         # `.clone().contiguous()` detaches each slice from the mmap so the
@@ -112,18 +143,20 @@ class LazyBatchList:
         return self._n > 0
 
     @staticmethod
-    def from_list(batches, directory):
+    def from_list(batches, directory, fp16=False):
         """Serialize each batch to its own file under ``directory`` and return
         a proxy. The caller is responsible for releasing the original list
         references after this returns.
         """
         os.makedirs(directory, exist_ok=True)
         for i, b in enumerate(batches):
+            if fp16:
+                _cast_lazy_keys(b, torch.float16)
             torch.save(b, os.path.join(directory, f"batch_{i:06d}.pt"))
-        return LazyBatchList(directory, len(batches))
+        return LazyBatchList(directory, len(batches), fp16=fp16)
 
 
-def _wrap_split_lazy(split, base_dir, split_name):
+def _wrap_split_lazy(split, base_dir, split_name, fp16=False):
     """Replace each inner batch list in a split with a LazyBatchList.
 
     A split is ``list[list[batch]]`` — outer is the dataset group index
@@ -134,7 +167,7 @@ def _wrap_split_lazy(split, base_dir, split_name):
     out = []
     for group_idx, data_list in enumerate(split):
         group_dir = os.path.join(base_dir, split_name, f"group_{group_idx}")
-        out.append(LazyBatchList.from_list(data_list, group_dir))
+        out.append(LazyBatchList.from_list(data_list, group_dir, fp16=fp16))
         # drop in-place so caller's `split` variable releases its refs as we go
         split[group_idx] = None
     return out
@@ -330,24 +363,25 @@ def load_all_datasets(cfg, device, only_keep=None):
     # already-LazyBatchList groups are detected and skipped here.
     if getattr(cfg.batching, "lazy_batches", None):
         base_dir = os.path.join(cfg.batching._preprocessed_graphs_dir, "lazy_batches")
+        lazy_fp16 = bool(getattr(cfg.batching, "lazy_batches_fp16", False))
 
         def _already_lazy(split):
             return all(isinstance(g, LazyBatchList) for g in split)
 
         if not _already_lazy(train_data):
             log(f"[lazy_batches] Serialising prepared train batches to {base_dir}.")
-            train_data = _wrap_split_lazy(train_data, base_dir, "train")
+            train_data = _wrap_split_lazy(train_data, base_dir, "train", fp16=lazy_fp16)
             gc.collect()
         if not _already_lazy(val_data):
             log(f"[lazy_batches] Serialising prepared val batches to {base_dir}.")
-            val_data = _wrap_split_lazy(val_data, base_dir, "val")
+            val_data = _wrap_split_lazy(val_data, base_dir, "val", fp16=lazy_fp16)
             gc.collect()
         if not _already_lazy(test_data):
             log(f"[lazy_batches] Serialising prepared test batches to {base_dir}.")
-            test_data = _wrap_split_lazy(test_data, base_dir, "test")
+            test_data = _wrap_split_lazy(test_data, base_dir, "test", fp16=lazy_fp16)
             gc.collect()
         total_batches = sum(len(g) for split in (train_data, val_data, test_data) for g in split)
-        log(f"[lazy_batches] Active; {total_batches} batch(es) on disk.")
+        log(f"[lazy_batches] Active; {total_batches} batch(es) on disk (fp16={lazy_fp16}).")
 
     # Optionally serialise test_data to disk so it can be dropped from RAM
     # during the long training loop. Re-loaded on-demand by inference_loop
@@ -907,6 +941,7 @@ def run_intra_graph_batching(datasets, full_data, device, max_node, cfg, graph_r
                     cfg.batching._preprocessed_graphs_dir, "lazy_batches"
                 )
                 os.makedirs(lazy_dir, exist_ok=True)
+            lazy_fp16 = bool(getattr(cfg.batching, "lazy_batches_fp16", False))
             datasets = compute_tgn_graphs(
                 datasets=datasets,
                 full_data=full_data,
@@ -918,6 +953,7 @@ def run_intra_graph_batching(datasets, full_data, device, max_node, cfg, graph_r
                 node_type_dim=sample.node_type_src.shape[1],
                 lazy_dir=lazy_dir,
                 split_names=["train", "val", "test"],
+                lazy_fp16=lazy_fp16,
             )
 
         else:
@@ -937,6 +973,7 @@ def compute_tgn_graphs(
     node_type_dim,
     lazy_dir=None,
     split_names=None,
+    lazy_fp16=False,
 ):
     """Compute per-batch TGN neighbor tensors.
 
@@ -1073,6 +1110,8 @@ def compute_tgn_graphs(
                     # for the rest of the loop and the per-batch *_tgn
                     # payload accumulates — which is exactly the OOM we are
                     # trying to avoid.
+                    if lazy_fp16:
+                        _cast_lazy_keys(batch, torch.float16)
                     torch.save(batch, os.path.join(group_dir, f"batch_{saved_count:06d}.pt"))
                     saved_count += 1
                     data_list[iter_idx] = None
@@ -1087,7 +1126,9 @@ def compute_tgn_graphs(
                 # doesn't reclaim it while we still need it).
                 data_list.clear()
                 new_groups.append(
-                    LazyBatchList(group_dir, saved_count, full_data=full_data)
+                    LazyBatchList(
+                        group_dir, saved_count, full_data=full_data, fp16=lazy_fp16
+                    )
                 )
                 gc.collect()
             else:
@@ -1317,15 +1358,24 @@ def reindex_graphs(datasets, graph_reindexer, device, use_tgn, x_is_tuple=False)
         for data_list in dataset:
             if isinstance(data_list, LazyBatchList):
                 # Disk-backed: load each batch, reindex, save back. Only one
-                # batch is resident at a time.
+                # batch is resident at a time. When the list is in fp16 mode
+                # we upcast wide floats to fp32 before reindexing (so the
+                # internal scatter ops run at full precision and the produced
+                # data.x / data.node_type match the non-lazy semantics) and
+                # downcast back before saving.
+                fp16 = data_list._fp16
                 for i in log_tqdm(range(len(data_list)), desc="Reindexing graphs"):
                     path = data_list._path(i)
                     batch = torch.load(path, map_location="cpu")
+                    if fp16:
+                        _cast_lazy_keys(batch, torch.float32)
                     batch.to(device)
                     graph_reindexer.reindex_graph(
                         batch, use_tgn=use_tgn, x_is_tuple=x_is_tuple
                     )
                     batch.to("cpu")
+                    if fp16:
+                        _cast_lazy_keys(batch, torch.float16)
                     torch.save(batch, path)
                     batch = None
             else:
