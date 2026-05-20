@@ -291,17 +291,30 @@ def load_all_datasets(cfg, device, only_keep=None):
     # x_from_tgn, x_to_tgn, x_tgn, node_type_tgn, edge_type_tgn, ...) live
     # in CPU RAM for the entire training run — on TGN systems this is
     # often 100-200GB. Lazy batches cut that to a single batch's worth.
+    #
+    # For the TGN path the streaming has already happened inside
+    # compute_tgn_graphs (so batches were never in RAM all at once); the
+    # already-LazyBatchList groups are detected and skipped here.
     if getattr(cfg.batching, "lazy_batches", None):
         base_dir = os.path.join(cfg.batching._preprocessed_graphs_dir, "lazy_batches")
-        log(f"[lazy_batches] Serialising prepared batches to {base_dir}.")
-        train_data = _wrap_split_lazy(train_data, base_dir, "train")
-        gc.collect()
-        val_data = _wrap_split_lazy(val_data, base_dir, "val")
-        gc.collect()
-        test_data = _wrap_split_lazy(test_data, base_dir, "test")
-        gc.collect()
+
+        def _already_lazy(split):
+            return all(isinstance(g, LazyBatchList) for g in split)
+
+        if not _already_lazy(train_data):
+            log(f"[lazy_batches] Serialising prepared train batches to {base_dir}.")
+            train_data = _wrap_split_lazy(train_data, base_dir, "train")
+            gc.collect()
+        if not _already_lazy(val_data):
+            log(f"[lazy_batches] Serialising prepared val batches to {base_dir}.")
+            val_data = _wrap_split_lazy(val_data, base_dir, "val")
+            gc.collect()
+        if not _already_lazy(test_data):
+            log(f"[lazy_batches] Serialising prepared test batches to {base_dir}.")
+            test_data = _wrap_split_lazy(test_data, base_dir, "test")
+            gc.collect()
         total_batches = sum(len(g) for split in (train_data, val_data, test_data) for g in split)
-        log(f"[lazy_batches] Wrote {total_batches} batch(es); replaced in-RAM lists.")
+        log(f"[lazy_batches] Active; {total_batches} batch(es) on disk.")
 
     # Optionally serialise test_data to disk so it can be dropped from RAM
     # during the long training loop. Re-loaded on-demand by inference_loop
@@ -852,6 +865,15 @@ def run_intra_graph_batching(datasets, full_data, device, max_node, cfg, graph_r
         elif method == "tgn_last_neighbor":
             tgn_loader_cfg = cfg.batching.intra_graph_batching.tgn_last_neighbor
             sample = datasets[0][0][0]
+            # If lazy_batches is requested, stream-save each fattened batch to
+            # disk inside compute_tgn_graphs so peak resident RAM stays bounded
+            # by a single batch instead of the whole dataset.
+            lazy_dir = None
+            if getattr(cfg.batching, "lazy_batches", None):
+                lazy_dir = os.path.join(
+                    cfg.batching._preprocessed_graphs_dir, "lazy_batches"
+                )
+                os.makedirs(lazy_dir, exist_ok=True)
             datasets = compute_tgn_graphs(
                 datasets=datasets,
                 full_data=full_data,
@@ -861,6 +883,8 @@ def run_intra_graph_batching(datasets, full_data, device, max_node, cfg, graph_r
                 tgn_loader_cfg=tgn_loader_cfg,
                 node_feat_dim=sample.x_src.shape[1],
                 node_type_dim=sample.node_type_src.shape[1],
+                lazy_dir=lazy_dir,
+                split_names=["train", "val", "test"],
             )
 
         else:
@@ -878,7 +902,22 @@ def compute_tgn_graphs(
     tgn_loader_cfg,
     node_feat_dim,
     node_type_dim,
+    lazy_dir=None,
+    split_names=None,
 ):
+    """Compute per-batch TGN neighbor tensors.
+
+    When ``lazy_dir`` is provided, each batch is serialised to disk
+    immediately after its *_tgn fields are set and the in-memory reference
+    is dropped. The caller receives a structure of LazyBatchList proxies
+    instead of fattened lists, so peak CPU RAM during this pass is bounded
+    by a single batch — not the entire dataset (~20MB * 50K batches → 1TB
+    on optc_h501-class data was previously the crash mode here).
+
+    The optional ``split_names`` is a per-dataset-group list of names used
+    to subdirectory the saved batches; if omitted, generic indices are
+    used. Returned shape mirrors the input: ``list[list-or-LazyBatchList]``.
+    """
     tgn_neighbor_n_hop = tgn_loader_cfg.tgn_neighbor_n_hop
     fix_tgn_neighbor_loader = tgn_loader_cfg.fix_tgn_neighbor_loader
     fix_buggy_orthrus_TGN = tgn_loader_cfg.fix_buggy_orthrus_TGN
@@ -894,8 +933,19 @@ def compute_tgn_graphs(
     node_type_cache = torch.zeros((max_node, node_type_dim), device=device)
     assoc = torch.empty(max_node, dtype=torch.long, device=device)
 
-    for dataset in datasets:
-        for data_list in dataset:
+    new_datasets = []
+    for ds_idx, dataset in enumerate(datasets):
+        split_name = (split_names[ds_idx] if split_names else f"ds_{ds_idx}") if lazy_dir else None
+        new_groups = []
+        for grp_idx, data_list in enumerate(dataset):
+            group_dir = (
+                os.path.join(lazy_dir, split_name, f"group_{grp_idx}") if lazy_dir else None
+            )
+            if group_dir is not None:
+                os.makedirs(group_dir, exist_ok=True)
+            saved_count = 0
+
+            iter_idx = 0
             for batch in log_tqdm(data_list, desc="Computing TGN last neighbor graphs"):
                 batch = batch.to(device)
                 batch_edge_index = batch.edge_index.clone()
@@ -974,7 +1024,30 @@ def compute_tgn_graphs(
                 if not insert_neighbors_before:
                     neighbor_loader.insert(src, dst)
 
-    return datasets
+                if group_dir is not None:
+                    # Stream-save mode: persist this batch then null out the
+                    # original list slot so the in-RAM reference can be
+                    # reclaimed. Without this the batch lives in `data_list`
+                    # for the rest of the loop and the per-batch *_tgn
+                    # payload accumulates — which is exactly the OOM we are
+                    # trying to avoid.
+                    torch.save(batch, os.path.join(group_dir, f"batch_{saved_count:06d}.pt"))
+                    saved_count += 1
+                    data_list[iter_idx] = None
+                    batch = None
+                iter_idx += 1
+
+            if group_dir is not None:
+                # In-place clear the now-mostly-None list and replace with the
+                # disk-backed proxy at the upstream slot.
+                data_list.clear()
+                new_groups.append(LazyBatchList(group_dir, saved_count))
+                gc.collect()
+            else:
+                new_groups.append(data_list)
+        new_datasets.append(new_groups)
+
+    return new_datasets
 
 
 def run_inter_graph_batching(datasets, cfg):
@@ -1195,7 +1268,23 @@ def load_model(model, path: str, cfg, map_location=None):
 def reindex_graphs(datasets, graph_reindexer, device, use_tgn, x_is_tuple=False):
     for dataset in datasets:
         for data_list in dataset:
-            for batch in log_tqdm(data_list, desc="Reindexing graphs"):
-                batch.to(device)
-                graph_reindexer.reindex_graph(batch, use_tgn=use_tgn, x_is_tuple=x_is_tuple)
-                batch.to("cpu")
+            if isinstance(data_list, LazyBatchList):
+                # Disk-backed: load each batch, reindex, save back. Only one
+                # batch is resident at a time.
+                for i in log_tqdm(range(len(data_list)), desc="Reindexing graphs"):
+                    path = data_list._path(i)
+                    batch = torch.load(path, map_location="cpu")
+                    batch.to(device)
+                    graph_reindexer.reindex_graph(
+                        batch, use_tgn=use_tgn, x_is_tuple=x_is_tuple
+                    )
+                    batch.to("cpu")
+                    torch.save(batch, path)
+                    batch = None
+            else:
+                for batch in log_tqdm(data_list, desc="Reindexing graphs"):
+                    batch.to(device)
+                    graph_reindexer.reindex_graph(
+                        batch, use_tgn=use_tgn, x_is_tuple=x_is_tuple
+                    )
+                    batch.to("cpu")

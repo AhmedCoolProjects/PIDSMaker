@@ -694,6 +694,13 @@ def generate_DAG(edges):
 
 def log_dataset_stats(datasets):
     def log_helper(label, dataset):
+        # Disk-backed (LazyBatchList) — log just the count to avoid forcing a
+        # full-disk scan that would defeat the purpose of streaming batches.
+        if hasattr(dataset, "_dir") and hasattr(dataset, "_n"):
+            log(f"{label} num graphs: {len(dataset)} (disk-backed)")
+            log("")
+            return
+
         edges = torch.tensor([d.src.shape[0] for d in dataset])
         nodes = torch.tensor([torch.unique(d.edge_index).shape[0] for d in dataset])
 
