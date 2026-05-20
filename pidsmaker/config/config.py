@@ -644,7 +644,9 @@ ENCODERS_CFG = {
         "architecture_str": Arg(str),
     },
     "none": {},
+    "linear_edge_feat": {},
 }
+
 
 DECODERS_NODE_LEVEL = ["node_mlp", "none", "magic_gat", "nodlink"]
 DECODERS_EDGE_LEVEL = ["edge_mlp"]
@@ -775,6 +777,12 @@ THRESHOLD_METHODS = ["max_val_loss", "mean_val_loss", "threatrace", "magic", "fl
 
 # --- Tasks, subtasks, and argument configurations ---
 TASK_ARGS = {
+    "edge_engineering": {
+        "enable_pair_recurrence": Arg(bool),
+        "enable_fanout_fanin": Arg(bool),
+        "enable_op_rarity": Arg(bool),
+        "enable_temporal": Arg(bool),
+    },
     "construction": {
         "used_method": Arg(
             str, vals=OR(["default", "magic"]), desc="The method to build time window graphs."
@@ -892,7 +900,7 @@ TASK_ARGS = {
         ),
         "edge_features": Arg(
             str,
-            vals=AND(["edge_type", "edge_type_triplet", "msg", "time_encoding", "none"]),
+            vals=AND(["edge_type", "edge_type_triplet", "msg", "time_encoding", "engineered", "none"]),
             desc="Edge features to used during GNN training. `edge_type` refers to the system call type, `edge_type_triplet` \
                                 considers a same edge type as a new type if source or destination node types are different, `msg` is the message vector \
                                 used in the TGN, `time_encoding` encodes temporal order of events with their timestamps in the TGN, `none` uses no features.",

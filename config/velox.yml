@@ -1,11 +1,19 @@
-# Simply the same config as orthrus_non_snooped + encoder set to none
+# VELOX configuration with statistical, window-based edge feature engineering
 
 _include_yml: orthrus_non_snooped
 
+edge_engineering:
+  enable_pair_recurrence: True
+  enable_fanout_fanin: True
+  enable_op_rarity: True
+  enable_temporal: True
+
 batching:
   lazy_test_data: True
+  edge_features: edge_type, engineered
   intra_graph_batching:
     used_methods: edges
+
 training:
   encoder:
-    used_methods: none # uses only a linear layer
+    used_methods: linear_edge_feat

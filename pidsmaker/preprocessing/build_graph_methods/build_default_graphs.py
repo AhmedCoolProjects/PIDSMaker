@@ -208,9 +208,21 @@ def gen_edge_fused_tw(indexid2msg, cfg):
 
         node_info = {}
         edge_list = []
+        raw_edges = [
+            {
+                "src": int(event[1]),
+                "dst": int(event[4]),
+                "time": int(event[6]),
+                "label": event[2],
+                "event_uuid": event[5]
+            }
+            for event in temp_list
+        ]
+        raw_to_fused_mapping = {}
+
         if cfg.construction.fuse_edge:
             edge_info = {}
-            for (
+            for raw_idx, (
                 _src_node,
                 src_index_id,
                 operation,
@@ -219,7 +231,7 @@ def gen_edge_fused_tw(indexid2msg, cfg):
                 event_uuid,
                 timestamp_rec,
                 _id,
-            ) in temp_list:
+            ) in enumerate(temp_list):
                 if src_index_id not in node_info:
                     node_type, label = indexid2msg[src_index_id]
                     node_info[src_index_id] = {"label": label, "node_type": node_type}
@@ -231,7 +243,7 @@ def gen_edge_fused_tw(indexid2msg, cfg):
                     edge_info[(src_index_id, dst_index_id)] = []
 
                 edge_info[(src_index_id, dst_index_id)].append(
-                    (timestamp_rec, operation, event_uuid)
+                    (timestamp_rec, operation, event_uuid, raw_idx)
                 )
 
             for (src, dst), data in edge_info.items():
@@ -254,7 +266,10 @@ def gen_edge_fused_tw(indexid2msg, cfg):
                 if current_type is not None and current_start_index is not None:
                     indices.append(current_start_index)
 
-                for k in indices:
+                pair_fused_start_idx = len(edge_list)
+                k_to_fused_idx = {}
+                for f_idx, k in enumerate(indices):
+                    k_to_fused_idx[k] = pair_fused_start_idx + f_idx
                     edge_list.append(
                         {
                             "src": src,
@@ -264,8 +279,15 @@ def gen_edge_fused_tw(indexid2msg, cfg):
                             "event_uuid": sorted_data[k][2],
                         }
                     )
+
+                active_k = None
+                for idx, entry in enumerate(sorted_data):
+                    timestamp_rec, operation, event_uuid, raw_idx = entry
+                    if idx in k_to_fused_idx:
+                        active_k = idx
+                    raw_to_fused_mapping[raw_idx] = k_to_fused_idx[active_k]
         else:
-            for (
+            for raw_idx, (
                 _src_node,
                 src_index_id,
                 operation,
@@ -274,7 +296,7 @@ def gen_edge_fused_tw(indexid2msg, cfg):
                 event_uuid,
                 timestamp_rec,
                 _id,
-            ) in temp_list:
+            ) in enumerate(temp_list):
                 if src_index_id not in node_info:
                     node_type, label = indexid2msg[src_index_id]
                     node_info[src_index_id] = {"label": label, "node_type": node_type}
@@ -291,13 +313,29 @@ def gen_edge_fused_tw(indexid2msg, cfg):
                         "event_uuid": event_uuid,
                     }
                 )
+                raw_to_fused_mapping[raw_idx] = raw_idx
+
+        # For unit/smoke tests, we only want few edges
+        NUM_TEST_EDGES = 2000
+        if cfg._test_mode and len(edge_list) > NUM_TEST_EDGES:
+            edge_list = edge_list[:NUM_TEST_EDGES + 1]
+
+        # Map raw edges only to valid (non-truncated) fused edges
+        fusion_idxs = []
+        keep_raw_edges = []
+        for raw_idx in range(len(raw_edges)):
+            fused_idx = raw_to_fused_mapping[raw_idx]
+            if fused_idx < len(edge_list):
+                fusion_idxs.append(fused_idx)
+                keep_raw_edges.append(raw_edges[raw_idx])
+        raw_edges = keep_raw_edges
 
         graph = nx.MultiDiGraph()
 
         for node, info in node_info.items():
             graph.add_node(node, node_type=info["node_type"], label=info["label"])
 
-        for i, edge in enumerate(edge_list):
+        for edge in edge_list:
             graph.add_edge(
                 edge["src"],
                 edge["dst"],
@@ -307,10 +345,8 @@ def gen_edge_fused_tw(indexid2msg, cfg):
                 y=0,
             )
 
-            # For unit tests, we only want few edges
-            NUM_TEST_EDGES = 2000
-            if cfg._test_mode and i >= NUM_TEST_EDGES:
-                break
+        graph.graph["raw_edges"] = raw_edges
+        graph.graph["fusion_idxs"] = fusion_idxs
 
         date_dir = f"{cfg.construction._graphs_dir}/graph_{date}/"
         os.makedirs(date_dir, exist_ok=True)

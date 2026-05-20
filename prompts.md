@@ -39,3 +39,18 @@ Format for each entry:
 > this is the first push we did error ... AttributeError: 'GlobalStorage' object has no attribute 'msg'
 
 **Agent action:** Diagnosed: P1.1's `del g.msg` (when not TGN+memory) was unsafe because model.py:73 unconditionally passes msg=batch.msg to the encoder. Hotfix removes the deletion block and keeps the other P1.1 wins (cloned views, slimmer get_full_data). Pushed hotfix + P2 commits together. Logged the lesson in skills/batch-msg-required.md.
+
+---
+### [2026-05-20 12:16] — Implement edge feature engineering for VELOX (velox_edge_feat_eng)
+**Prompt:**
+> Implement "velox_edge_feat_eng" — edge feature engineering for PIDSMaker's VELOX model to improve anomaly detection.
+> [and detailed instructions on VELOX workflow, task constraints, database analysis, integration, files to read, and deliverables]
+
+**Agent action (1–3 lines):** Started planning the implementation of edge feature engineering, analyzed DARPA datasets, and designed statistical features for window-based edge behavioral context.
+
+---
+### [2026-05-20 13:38] — Approval of Implementation Plan for velox_edge_feat_eng
+**Prompt:**
+> approved
+
+**Agent action (1–3 lines):** Received approval for the implementation plan. Created task.md and began executing code changes across config.py, factory.py, build_default_graphs.py, feat_inference.py, and data_utils.py.

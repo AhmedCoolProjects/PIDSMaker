@@ -1,3 +1,9 @@
+edge_engineering:
+  enable_pair_recurrence: False
+  enable_fanout_fanin: False
+  enable_op_rarity: False
+  enable_temporal: False
+
 transformation:
   used_methods: none
   synthetic_attack_naive:

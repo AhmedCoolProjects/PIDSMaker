@@ -496,7 +496,16 @@ def extract_msg_from_data(
             msg = torch.cat([x_src, x_dst, fields["edge_type"]], dim=-1)
 
         num_edge_types = get_num_edge_type(cfg)
-        edge_feats = build_edge_feats(fields, msg, edge_features, possible_triplets, num_edge_types)
+        engineered_dim = get_engineered_feats_dim(cfg)
+        edge_feats = build_edge_feats(
+            fields,
+            msg,
+            edge_features,
+            possible_triplets,
+            num_edge_types,
+            getattr(g, "engineered_feats", None),
+            engineered_dim
+        )
 
         edge_type = (
             get_triplet_edge_types(
@@ -550,7 +559,23 @@ def get_triplet_edge_types(src_type, dst_type, edge_type, possible_triplets, num
     return F.one_hot(matches.long().argmax(dim=1), num_classes=num_edge_types).to(torch.float)
 
 
-def build_edge_feats(fields, msg, edge_features, possible_triplets, num_edge_types):
+def get_engineered_feats_dim(cfg) -> int:
+    ee = getattr(cfg, "edge_engineering", None)
+    if ee is None:
+        return 0
+    dim = 0
+    if getattr(ee, "enable_pair_recurrence", False):
+        dim += 2
+    if getattr(ee, "enable_fanout_fanin", False):
+        dim += 2
+    if getattr(ee, "enable_op_rarity", False):
+        dim += 2
+    if getattr(ee, "enable_temporal", False):
+        dim += 6
+    return dim
+
+
+def build_edge_feats(fields, msg, edge_features, possible_triplets, num_edge_types, engineered_feats=None, engineered_dim=0):
     edge_feats = []
     if "edge_type" in edge_features:
         edge_feats.append(fields["edge_type"])
@@ -565,6 +590,12 @@ def build_edge_feats(fields, msg, edge_features, possible_triplets, num_edge_typ
         edge_feats.append(triplets)
     if "msg" in edge_features:
         edge_feats.append(msg)
+    if "engineered" in edge_features:
+        if engineered_feats is not None:
+            edge_feats.append(engineered_feats)
+        elif engineered_dim > 0:
+            fallback = torch.zeros(fields["edge_type"].shape[0], engineered_dim, device=fields["edge_type"].device)
+            edge_feats.append(fallback)
     edge_feats = torch.cat(edge_feats, dim=-1) if len(edge_feats) > 0 else None
     return edge_feats
 
