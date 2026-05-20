@@ -50,17 +50,50 @@ class LazyBatchList:
     have run. The training/inference loops never need to know whether they
     are iterating an in-RAM list or one of these — same ``__iter__``,
     ``__len__``, ``__getitem__`` semantics.
+
+    When ``full_data`` is provided, three TGN edge-feature tensors
+    (``msg_tgn``, ``t_tgn``, ``edge_type_tgn``) are *not* saved per batch —
+    only the ``e_id_tgn`` index — and they get hydrated from ``full_data``
+    at iteration time. This is the dominant on-disk saving for big TGN
+    runs (msg_tgn alone is typically ~10MB/batch).
     """
 
-    def __init__(self, directory, num_batches):
+    def __init__(self, directory, num_batches, full_data=None):
         self._dir = directory
         self._n = int(num_batches)
+        # Holding full_data here keeps the mmap-backed tensors alive for the
+        # lifetime of this list, so `del full_data` upstream is harmless.
+        self._full_data = full_data
 
     def __len__(self):
         return self._n
 
     def _path(self, idx):
         return os.path.join(self._dir, f"batch_{idx:06d}.pt")
+
+    def _hydrate(self, batch):
+        """Re-attach TGN edge features from full_data using batch.e_id_tgn.
+
+        No-op when ``self._full_data`` is None or the batch was saved with
+        msg_tgn / t_tgn / edge_type_tgn already on it.
+        """
+        if self._full_data is None:
+            return batch
+        if not hasattr(batch, "e_id_tgn"):
+            return batch
+        e_id = batch.e_id_tgn
+        # `.clone().contiguous()` detaches each slice from the mmap so the
+        # GPU transfer downstream doesn't have to fault file pages on every
+        # forward pass; the rehydrated tensor is in normal pageable RAM.
+        if not hasattr(batch, "msg_tgn"):
+            batch.msg_tgn = torch.as_tensor(self._full_data.msg[e_id]).clone().contiguous()
+        if not hasattr(batch, "t_tgn"):
+            batch.t_tgn = torch.as_tensor(self._full_data.t[e_id]).clone().contiguous()
+        if not hasattr(batch, "edge_type_tgn"):
+            batch.edge_type_tgn = (
+                torch.as_tensor(self._full_data.edge_type[e_id]).clone().contiguous()
+            )
+        return batch
 
     def __getitem__(self, idx):
         if isinstance(idx, slice):
@@ -69,11 +102,11 @@ class LazyBatchList:
             idx += self._n
         if not 0 <= idx < self._n:
             raise IndexError(idx)
-        return torch.load(self._path(idx), map_location="cpu")
+        return self._hydrate(torch.load(self._path(idx), map_location="cpu"))
 
     def __iter__(self):
         for i in range(self._n):
-            yield torch.load(self._path(i), map_location="cpu")
+            yield self._hydrate(torch.load(self._path(i), map_location="cpu"))
 
     def __bool__(self):
         return self._n > 0
@@ -1014,10 +1047,19 @@ def compute_tgn_graphs(
                 batch.n_id_tgn = n_id
                 batch.edge_index_tgn = edge_index
                 batch.reindexed_edge_index_tgn = assoc[batch.edge_index]
-                batch.msg_tgn = full_data.msg[e_id.cpu()]
-                batch.t_tgn = full_data.t[e_id.cpu()]
                 batch.node_type_tgn = node_type_cache[n_id]
-                batch.edge_type_tgn = full_data.edge_type[e_id.cpu()]
+                if group_dir is not None:
+                    # Stream-save mode: keep just the global edge indices on
+                    # the batch so LazyBatchList can rehydrate msg_tgn /
+                    # t_tgn / edge_type_tgn from full_data at iteration time.
+                    # msg_tgn alone is ~10MB/batch — skipping it is the
+                    # difference between lazy_batches needing TBs of disk
+                    # and fitting in a normal scratch budget.
+                    batch.e_id_tgn = e_id.cpu()
+                else:
+                    batch.msg_tgn = full_data.msg[e_id.cpu()]
+                    batch.t_tgn = full_data.t[e_id.cpu()]
+                    batch.edge_type_tgn = full_data.edge_type[e_id.cpu()]
 
                 batch = batch.to("cpu")
 
@@ -1039,9 +1081,14 @@ def compute_tgn_graphs(
 
             if group_dir is not None:
                 # In-place clear the now-mostly-None list and replace with the
-                # disk-backed proxy at the upstream slot.
+                # disk-backed proxy at the upstream slot. We hand the proxy a
+                # reference to full_data so it can re-hydrate the skipped TGN
+                # edge features on iteration (and so `del full_data` upstream
+                # doesn't reclaim it while we still need it).
                 data_list.clear()
-                new_groups.append(LazyBatchList(group_dir, saved_count))
+                new_groups.append(
+                    LazyBatchList(group_dir, saved_count, full_data=full_data)
+                )
                 gc.collect()
             else:
                 new_groups.append(data_list)
