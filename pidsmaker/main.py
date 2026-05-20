@@ -32,12 +32,15 @@ from pidsmaker.experiments.tuning import (
 )
 from pidsmaker.experiments.uncertainty import (
     avg_std_metrics,
+    best_adp_metrics,
     fuse_hyperparameter_metrics,
-    max_metrics,
-    min_metrics,
+    include_metric_in_stats,
     prepare_for_deep_ensemble,
     push_best_files_to_wandb,
+    true_max_metrics,
+    true_min_metrics,
     update_cfg_for_uncertainty_exp,
+    worst_adp_metrics,
 )
 from pidsmaker.tasks import (
     batching,
@@ -258,6 +261,13 @@ def main(cfg, project=None, exp=None, sweep_id=None, **kwargs):
                         metrics, times = run_pipeline(cfg, method=method, iteration=i)
                         method_to_metrics[method].append({**metrics, **times})
 
+                        iter_log = {
+                            f"{method}/iter_{i}/{k}": v
+                            for k, v in {**metrics, **times}.items()
+                            if include_metric_in_stats(v)
+                        }
+                        wandb.log(iter_log)
+
                         # We force restart in some methods so we avoid forced restart for other methods
                         cfg._force_restart = ""
                         cfg._is_running_mc_dropout = False
@@ -269,13 +279,13 @@ def main(cfg, project=None, exp=None, sweep_id=None, **kwargs):
             torch.save(method_to_metrics, method_to_metrics_path)
             wandb.save(method_to_metrics_path, out_dir)
 
-            averaged_metrics = avg_std_metrics(method_to_metrics)
-            minimum_metrics = min_metrics(method_to_metrics)
-            maximum_metrics = max_metrics(method_to_metrics)
-
-            wandb.log(averaged_metrics)
-            wandb.log(minimum_metrics)
-            wandb.log(maximum_metrics)
+            wandb.log({
+                **avg_std_metrics(method_to_metrics),
+                **true_max_metrics(method_to_metrics),
+                **true_min_metrics(method_to_metrics),
+                **best_adp_metrics(method_to_metrics),
+                **worst_adp_metrics(method_to_metrics),
+            })
 
             push_best_files_to_wandb(method_to_metrics, cfg)
 

@@ -8,6 +8,7 @@ Provides custom PyTorch Geometric data structures and utilities for:
 """
 
 import copy
+import gc
 import math
 import os
 import pickle
@@ -33,7 +34,151 @@ from pidsmaker.utils.dataset_utils import (
     get_rel2id,
     get_possible_events,
 )
-from pidsmaker.utils.utils import get_multi_datasets, log_dataset_stats, log_tqdm
+from pidsmaker.utils.utils import get_multi_datasets, log, log_dataset_stats, log_tqdm
+
+
+class LazyBatchList:
+    """Disk-backed iterable replacing an in-RAM list of fully-prepared batches.
+
+    Each batch is serialized to its own ``.pt`` file under ``dir`` and named
+    ``batch_<idx:06d>.pt``. Iteration loads one batch at a time and yields
+    it; nothing is cached between accesses, so peak resident memory is
+    bounded by a single batch.
+
+    Designed as a drop-in replacement for the inner ``data_list`` of
+    ``train_data`` / ``val_data`` / ``test_data`` after all batching stages
+    have run. The training/inference loops never need to know whether they
+    are iterating an in-RAM list or one of these — same ``__iter__``,
+    ``__len__``, ``__getitem__`` semantics.
+
+    When ``full_data`` is provided, three TGN edge-feature tensors
+    (``msg_tgn``, ``t_tgn``, ``edge_type_tgn``) are *not* saved per batch —
+    only the ``e_id_tgn`` index — and they get hydrated from ``full_data``
+    at iteration time. This is the dominant on-disk saving for big TGN
+    runs (msg_tgn alone is typically ~10MB/batch).
+    """
+
+    def __init__(self, directory, num_batches, full_data=None):
+        self._dir = directory
+        self._n = int(num_batches)
+        # Holding full_data here keeps the mmap-backed tensors alive for the
+        # lifetime of this list, so `del full_data` upstream is harmless.
+        self._full_data = full_data
+
+    def __len__(self):
+        return self._n
+
+    def _path(self, idx):
+        return os.path.join(self._dir, f"batch_{idx:06d}.pt")
+
+    def _hydrate(self, batch):
+        """Re-attach TGN edge features from full_data using batch.e_id_tgn.
+
+        No-op when ``self._full_data`` is None or the batch was saved with
+        msg_tgn / t_tgn / edge_type_tgn already on it.
+        """
+        if self._full_data is None:
+            return batch
+        if not hasattr(batch, "e_id_tgn"):
+            return batch
+        e_id = batch.e_id_tgn
+        # `.clone().contiguous()` detaches each slice from the mmap so the
+        # GPU transfer downstream doesn't have to fault file pages on every
+        # forward pass; the rehydrated tensor is in normal pageable RAM.
+        if not hasattr(batch, "msg_tgn"):
+            batch.msg_tgn = torch.as_tensor(self._full_data.msg[e_id]).clone().contiguous()
+        if not hasattr(batch, "t_tgn"):
+            batch.t_tgn = torch.as_tensor(self._full_data.t[e_id]).clone().contiguous()
+        if not hasattr(batch, "edge_type_tgn"):
+            batch.edge_type_tgn = (
+                torch.as_tensor(self._full_data.edge_type[e_id]).clone().contiguous()
+            )
+        return batch
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            return [self[i] for i in range(*idx.indices(self._n))]
+        if idx < 0:
+            idx += self._n
+        if not 0 <= idx < self._n:
+            raise IndexError(idx)
+        return self._hydrate(torch.load(self._path(idx), map_location="cpu"))
+
+    def __iter__(self):
+        for i in range(self._n):
+            yield self._hydrate(torch.load(self._path(i), map_location="cpu"))
+
+    def __bool__(self):
+        return self._n > 0
+
+    @staticmethod
+    def from_list(batches, directory):
+        """Serialize each batch to its own file under ``directory`` and return
+        a proxy. The caller is responsible for releasing the original list
+        references after this returns.
+        """
+        os.makedirs(directory, exist_ok=True)
+        for i, b in enumerate(batches):
+            torch.save(b, os.path.join(directory, f"batch_{i:06d}.pt"))
+        return LazyBatchList(directory, len(batches))
+
+
+def _wrap_split_lazy(split, base_dir, split_name):
+    """Replace each inner batch list in a split with a LazyBatchList.
+
+    A split is ``list[list[batch]]`` — outer is the dataset group index
+    (always length 1 for single-dataset; longer for multi-dataset).
+    Returns the new outer list and frees the input as it goes so the
+    caller's RAM doesn't carry both copies.
+    """
+    out = []
+    for group_idx, data_list in enumerate(split):
+        group_dir = os.path.join(base_dir, split_name, f"group_{group_idx}")
+        out.append(LazyBatchList.from_list(data_list, group_dir))
+        # drop in-place so caller's `split` variable releases its refs as we go
+        split[group_idx] = None
+    return out
+
+
+class LazyTestData:
+    """Disk-backed proxy for a fully-processed test_data structure.
+
+    `test_data` is a `list[list[CollatableTemporalData]]` (outer list = per
+    dataset group, inner list = batches). On huge datasets keeping it in
+    RAM through the entire training loop dwarfs the model itself. This
+    proxy serialises it once to disk, drops the in-RAM copy, and re-loads
+    it on iteration. Call `release()` after evaluation to free the cache.
+
+    Iteration semantics are identical to the underlying list, so callers
+    (inference_loop) need no changes.
+    """
+
+    def __init__(self, path):
+        self._path = path
+        self._cached = None
+
+    def _load(self):
+        if self._cached is None:
+            self._cached = torch.load(self._path, map_location="cpu")
+        return self._cached
+
+    def release(self):
+        """Drop the cached payload so subsequent iteration re-reads from disk."""
+        self._cached = None
+        gc.collect()
+
+    def __iter__(self):
+        return iter(self._load())
+
+    def __len__(self):
+        return len(self._load())
+
+    def __getitem__(self, i):
+        return self._load()[i]
+
+    def __bool__(self):
+        # Keep `if test_data:` checks working without forcing a load.
+        return True
 
 
 class CollatableTemporalData(TemporalData):
@@ -119,10 +264,35 @@ def load_all_datasets(cfg, device, only_keep=None):
         val_data = val_data[:only_keep]
         test_data = test_data[:only_keep]
 
-    full_data = get_full_data([train_data, val_data, test_data])
+    # TGN's last-neighbor batching is the only consumer of the heavy fields
+    # (msg / t / edge_type) on `full_data`. For non-TGN paths we don't need
+    # full_data at all — max_node is streamed from per-graph tensors below.
+    intra_methods = cfg.batching.intra_graph_batching.used_methods or ""
+    use_tgn_last_neighbor = "tgn_last_neighbor" in intra_methods
 
-    max_node = torch.cat([full_data.src, full_data.dst]).max().item() + 1
+    # Compute max_node without building a full concatenated copy of src/dst.
+    max_node = compute_max_node([train_data, val_data, test_data])
     print(f"Max node in {cfg.dataset.name}: {max_node}")
+
+    if use_tgn_last_neighbor:
+        full_keys = ["msg", "t", "edge_type", "src", "dst"]
+        if getattr(cfg.batching, "mmap_full_data", None):
+            mmap_dir = os.path.join(cfg.batching._preprocessed_graphs_dir, "full_data_mmap")
+            log(f"[mmap_full_data] Building disk-backed full_data at {mmap_dir}.")
+            full_data = build_full_data_mmap(
+                [train_data, val_data, test_data], keys=full_keys, out_dir=mmap_dir
+            )
+        else:
+            full_data = get_full_data([train_data, val_data, test_data], keys=full_keys)
+    else:
+        full_data = None
+
+    # NOTE: a previous version of this function tried to del `g.msg` whenever
+    # TGN memory was not in use. That is unsafe — `model.embed()` always
+    # passes `msg=batch.msg` to the encoder regardless of whether the encoder
+    # consumes it (the kwarg access itself raises AttributeError when the
+    # attribute is missing). Keep per-graph msg around; the real savings
+    # come from skipping it in `full_data` (above) and from `mmap_full_data`.
 
     graph_reindexer = GraphReindexer(
         device=device,
@@ -132,9 +302,13 @@ def load_all_datasets(cfg, device, only_keep=None):
 
     # Global batching (unique edge type batches, fixed-size edge length)
     datasets = run_global_batching(train_data, val_data, test_data, cfg, device)
+    del train_data, val_data, test_data
+    gc.collect()
 
     # Intra graph batching (TGN 1024 batches, last neighbor loader)
     datasets = run_intra_graph_batching(datasets, full_data, device, max_node, cfg, graph_reindexer)
+    del full_data
+    gc.collect()
 
     # Reindexing stuff (create node-level attributes)
     datasets = run_reindexing_preprocessing(datasets, graph_reindexer, device, cfg)
@@ -143,6 +317,55 @@ def load_all_datasets(cfg, device, only_keep=None):
     datasets = run_inter_graph_batching(datasets, cfg)
 
     train_data, val_data, test_data = datasets
+
+    # Optionally swap every prepared batch out to disk and replace the
+    # in-RAM lists with LazyBatchList proxies. After all batching stages
+    # the precomputed TGN neighbor tensors per batch (msg_tgn, t_tgn,
+    # x_from_tgn, x_to_tgn, x_tgn, node_type_tgn, edge_type_tgn, ...) live
+    # in CPU RAM for the entire training run — on TGN systems this is
+    # often 100-200GB. Lazy batches cut that to a single batch's worth.
+    #
+    # For the TGN path the streaming has already happened inside
+    # compute_tgn_graphs (so batches were never in RAM all at once); the
+    # already-LazyBatchList groups are detected and skipped here.
+    if getattr(cfg.batching, "lazy_batches", None):
+        base_dir = os.path.join(cfg.batching._preprocessed_graphs_dir, "lazy_batches")
+
+        def _already_lazy(split):
+            return all(isinstance(g, LazyBatchList) for g in split)
+
+        if not _already_lazy(train_data):
+            log(f"[lazy_batches] Serialising prepared train batches to {base_dir}.")
+            train_data = _wrap_split_lazy(train_data, base_dir, "train")
+            gc.collect()
+        if not _already_lazy(val_data):
+            log(f"[lazy_batches] Serialising prepared val batches to {base_dir}.")
+            val_data = _wrap_split_lazy(val_data, base_dir, "val")
+            gc.collect()
+        if not _already_lazy(test_data):
+            log(f"[lazy_batches] Serialising prepared test batches to {base_dir}.")
+            test_data = _wrap_split_lazy(test_data, base_dir, "test")
+            gc.collect()
+        total_batches = sum(len(g) for split in (train_data, val_data, test_data) for g in split)
+        log(f"[lazy_batches] Active; {total_batches} batch(es) on disk.")
+
+    # Optionally serialise test_data to disk so it can be dropped from RAM
+    # during the long training loop. Re-loaded on-demand by inference_loop
+    # via LazyTestData iteration semantics.
+    # NOTE: with lazy_batches on, test_data is already disk-backed per batch,
+    # so this extra step would just create a redundant full-split pickle.
+    if getattr(cfg.batching, "lazy_test_data", None) and not getattr(
+        cfg.batching, "lazy_batches", None
+    ):
+        out_dir = cfg.batching._preprocessed_graphs_dir
+        os.makedirs(out_dir, exist_ok=True)
+        test_path = os.path.join(out_dir, "test_data.lazy.pkl")
+        log(f"[lazy_test_data] Saving test_data to {test_path} and freeing it from RAM.")
+        torch.save(test_data, test_path)
+        del test_data
+        gc.collect()
+        test_data = LazyTestData(test_path)
+
     return train_data, val_data, test_data, max_node
 
 
@@ -290,12 +513,15 @@ def extract_msg_from_data(
         g.x_src = x_src
         g.x_dst = x_dst
         g.edge_feats = edge_feats
-        g.edge_type = edge_type
-        g.node_type_src = fields["src_type"]
-        g.node_type_dst = fields["dst_type"]
+        # node_type_src/dst (and edge_type when not using triplets) are views into the
+        # original g.msg. Cloning detaches them so the wide msg can be freed later by
+        # callers (e.g. once `full_data` is built and per-graph msg is no longer needed).
+        g.edge_type = edge_type if edge_type is not fields["edge_type"] else edge_type.clone()
+        g.node_type_src = fields["src_type"].clone()
+        g.node_type_dst = fields["dst_type"].clone()
 
         if "tgn" in cfg.training.encoder.used_methods and cfg.training.encoder.tgn.use_memory:
-            g.msg = msg
+            g.msg = msg  # smaller rebuilt msg; original wide msg can now be GC'd
 
         # NOTE: do not add edge_index as it is already within `CollatableTemporalData`
         # g.edge_index = ...
@@ -343,10 +569,111 @@ def build_edge_feats(fields, msg, edge_features, possible_triplets, num_edge_typ
     return edge_feats
 
 
-def get_full_data(datasets):
-    all_data = {
-        k: [] for k in ["msg", "t", "edge_type", "node_type_src", "node_type_dst", "src", "dst"]
-    }
+def compute_max_node(datasets):
+    """Stream max(src, dst) across every per-graph tensor.
+
+    Replaces ``torch.cat([full_data.src, full_data.dst]).max()`` which built
+    a full extra copy of every src/dst tensor just to find the max. Returns
+    ``max + 1`` so it matches the previous +1 convention.
+    """
+    max_node = -1
+    for dataset_group in datasets:
+        for dataset in dataset_group:
+            for data in dataset:
+                if data.src.numel():
+                    m = int(data.src.max().item())
+                    if m > max_node:
+                        max_node = m
+                if data.dst.numel():
+                    m = int(data.dst.max().item())
+                    if m > max_node:
+                        max_node = m
+    return max_node + 1
+
+
+def build_full_data_mmap(datasets, keys, out_dir):
+    """Concatenate per-graph attributes into disk-backed memory-mapped tensors.
+
+    Each key gets its own raw binary file written sequentially, one per-graph
+    slice at a time. Peak RAM is bounded by a single per-graph tensor — the
+    full concatenated copy never exists in memory. The returned ``Data``
+    exposes ``np.memmap``-backed torch tensors; indexing (e.g.
+    ``full_data.msg[e_id]``) pages in the requested rows on demand and the
+    gathered slice gets a new in-RAM allocation only for the gathered rows.
+
+    Uses numpy.memmap rather than torch.UntypedStorage.from_file so we stay
+    compatible with the torch 1.13 pin in this project's Dockerfile.
+    """
+    import numpy as np
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # First pass: collect dtype, tail shape, total length for every key.
+    sample_per_key = {}
+    total_E = 0
+    for dataset_group in datasets:
+        for dataset in dataset_group:
+            for data in dataset:
+                total_E += int(data.src.numel())
+                for k in keys:
+                    if k not in sample_per_key:
+                        sample_per_key[k] = getattr(data, k)
+
+    full_data = Data()
+    full_data._mmap_arrays = []  # keep numpy memmap refs alive
+
+    for k in keys:
+        sample = sample_per_key[k]
+        torch_dtype = sample.dtype
+        tail_shape = tuple(int(s) for s in sample.shape[1:])
+        path = os.path.join(out_dir, f"full_{k}.bin")
+
+        # Second pass: stream per-graph slices to disk. Each iteration touches
+        # one tensor at a time so peak extra RAM is bounded by the largest
+        # single per-graph tensor (not the full concatenation).
+        with open(path, "wb") as f:
+            for dataset_group in datasets:
+                for dataset in dataset_group:
+                    for data in dataset:
+                        t = getattr(data, k).contiguous()
+                        # `.numpy()` is zero-copy; tobytes copies once, then is
+                        # GC'd as the next iteration starts.
+                        f.write(t.numpy().tobytes())
+
+        # Read back as a memory-mapped numpy array, then wrap as a torch
+        # tensor. torch.from_numpy shares memory with the memmap, so element
+        # access pages in from disk; no full-in-RAM copy is made.
+        shape = (total_E,) + tail_shape if tail_shape else (total_E,)
+        np_dtype = {
+            torch.float32: np.float32,
+            torch.float64: np.float64,
+            torch.float16: np.float16,
+            torch.int64: np.int64,
+            torch.int32: np.int32,
+            torch.int16: np.int16,
+            torch.int8: np.int8,
+            torch.uint8: np.uint8,
+            torch.bool: np.bool_,
+        }[torch_dtype]
+        arr = np.memmap(path, dtype=np_dtype, mode="r", shape=shape)
+        full_data._mmap_arrays.append(arr)
+        setattr(full_data, k, torch.from_numpy(arr))
+
+    log(f"[mmap_full_data] Wrote {len(keys)} key(s) totalling {total_E} edges to {out_dir}.")
+    return full_data
+
+
+def get_full_data(datasets, keys=None):
+    """Concatenate per-graph attributes into a single Data object.
+
+    Only the keys actually consumed downstream are gathered (default: msg, t,
+    edge_type, src, dst — `node_type_src/dst` were collected historically but
+    never read). The narrower set lets callers skip work entirely when they
+    don't need the TGN-only fields.
+    """
+    if keys is None:
+        keys = ["msg", "t", "edge_type", "src", "dst"]
+    all_data = {k: [] for k in keys}
     for dataset_group in datasets:
         for dataset in dataset_group:
             for data in dataset:
@@ -354,6 +681,9 @@ def get_full_data(datasets):
                     all_data[k].append(getattr(data, k))
 
     full_data = Data(**{k: torch.cat(v) for k, v in all_data.items()})
+    # Free the per-key Python lists holding view references onto every graph
+    # before returning (frees one extra reference each, allowing earlier GC).
+    all_data.clear()
     return full_data
 
 
@@ -568,6 +898,15 @@ def run_intra_graph_batching(datasets, full_data, device, max_node, cfg, graph_r
         elif method == "tgn_last_neighbor":
             tgn_loader_cfg = cfg.batching.intra_graph_batching.tgn_last_neighbor
             sample = datasets[0][0][0]
+            # If lazy_batches is requested, stream-save each fattened batch to
+            # disk inside compute_tgn_graphs so peak resident RAM stays bounded
+            # by a single batch instead of the whole dataset.
+            lazy_dir = None
+            if getattr(cfg.batching, "lazy_batches", None):
+                lazy_dir = os.path.join(
+                    cfg.batching._preprocessed_graphs_dir, "lazy_batches"
+                )
+                os.makedirs(lazy_dir, exist_ok=True)
             datasets = compute_tgn_graphs(
                 datasets=datasets,
                 full_data=full_data,
@@ -577,6 +916,8 @@ def run_intra_graph_batching(datasets, full_data, device, max_node, cfg, graph_r
                 tgn_loader_cfg=tgn_loader_cfg,
                 node_feat_dim=sample.x_src.shape[1],
                 node_type_dim=sample.node_type_src.shape[1],
+                lazy_dir=lazy_dir,
+                split_names=["train", "val", "test"],
             )
 
         else:
@@ -594,7 +935,22 @@ def compute_tgn_graphs(
     tgn_loader_cfg,
     node_feat_dim,
     node_type_dim,
+    lazy_dir=None,
+    split_names=None,
 ):
+    """Compute per-batch TGN neighbor tensors.
+
+    When ``lazy_dir`` is provided, each batch is serialised to disk
+    immediately after its *_tgn fields are set and the in-memory reference
+    is dropped. The caller receives a structure of LazyBatchList proxies
+    instead of fattened lists, so peak CPU RAM during this pass is bounded
+    by a single batch — not the entire dataset (~20MB * 50K batches → 1TB
+    on optc_h501-class data was previously the crash mode here).
+
+    The optional ``split_names`` is a per-dataset-group list of names used
+    to subdirectory the saved batches; if omitted, generic indices are
+    used. Returned shape mirrors the input: ``list[list-or-LazyBatchList]``.
+    """
     tgn_neighbor_n_hop = tgn_loader_cfg.tgn_neighbor_n_hop
     fix_tgn_neighbor_loader = tgn_loader_cfg.fix_tgn_neighbor_loader
     fix_buggy_orthrus_TGN = tgn_loader_cfg.fix_buggy_orthrus_TGN
@@ -610,8 +966,19 @@ def compute_tgn_graphs(
     node_type_cache = torch.zeros((max_node, node_type_dim), device=device)
     assoc = torch.empty(max_node, dtype=torch.long, device=device)
 
-    for dataset in datasets:
-        for data_list in dataset:
+    new_datasets = []
+    for ds_idx, dataset in enumerate(datasets):
+        split_name = (split_names[ds_idx] if split_names else f"ds_{ds_idx}") if lazy_dir else None
+        new_groups = []
+        for grp_idx, data_list in enumerate(dataset):
+            group_dir = (
+                os.path.join(lazy_dir, split_name, f"group_{grp_idx}") if lazy_dir else None
+            )
+            if group_dir is not None:
+                os.makedirs(group_dir, exist_ok=True)
+            saved_count = 0
+
+            iter_idx = 0
             for batch in log_tqdm(data_list, desc="Computing TGN last neighbor graphs"):
                 batch = batch.to(device)
                 batch_edge_index = batch.edge_index.clone()
@@ -680,17 +1047,54 @@ def compute_tgn_graphs(
                 batch.n_id_tgn = n_id
                 batch.edge_index_tgn = edge_index
                 batch.reindexed_edge_index_tgn = assoc[batch.edge_index]
-                batch.msg_tgn = full_data.msg[e_id.cpu()]
-                batch.t_tgn = full_data.t[e_id.cpu()]
                 batch.node_type_tgn = node_type_cache[n_id]
-                batch.edge_type_tgn = full_data.edge_type[e_id.cpu()]
+                if group_dir is not None:
+                    # Stream-save mode: keep just the global edge indices on
+                    # the batch so LazyBatchList can rehydrate msg_tgn /
+                    # t_tgn / edge_type_tgn from full_data at iteration time.
+                    # msg_tgn alone is ~10MB/batch — skipping it is the
+                    # difference between lazy_batches needing TBs of disk
+                    # and fitting in a normal scratch budget.
+                    batch.e_id_tgn = e_id.cpu()
+                else:
+                    batch.msg_tgn = full_data.msg[e_id.cpu()]
+                    batch.t_tgn = full_data.t[e_id.cpu()]
+                    batch.edge_type_tgn = full_data.edge_type[e_id.cpu()]
 
                 batch = batch.to("cpu")
 
                 if not insert_neighbors_before:
                     neighbor_loader.insert(src, dst)
 
-    return datasets
+                if group_dir is not None:
+                    # Stream-save mode: persist this batch then null out the
+                    # original list slot so the in-RAM reference can be
+                    # reclaimed. Without this the batch lives in `data_list`
+                    # for the rest of the loop and the per-batch *_tgn
+                    # payload accumulates — which is exactly the OOM we are
+                    # trying to avoid.
+                    torch.save(batch, os.path.join(group_dir, f"batch_{saved_count:06d}.pt"))
+                    saved_count += 1
+                    data_list[iter_idx] = None
+                    batch = None
+                iter_idx += 1
+
+            if group_dir is not None:
+                # In-place clear the now-mostly-None list and replace with the
+                # disk-backed proxy at the upstream slot. We hand the proxy a
+                # reference to full_data so it can re-hydrate the skipped TGN
+                # edge features on iteration (and so `del full_data` upstream
+                # doesn't reclaim it while we still need it).
+                data_list.clear()
+                new_groups.append(
+                    LazyBatchList(group_dir, saved_count, full_data=full_data)
+                )
+                gc.collect()
+            else:
+                new_groups.append(data_list)
+        new_datasets.append(new_groups)
+
+    return new_datasets
 
 
 def run_inter_graph_batching(datasets, cfg):
@@ -911,7 +1315,23 @@ def load_model(model, path: str, cfg, map_location=None):
 def reindex_graphs(datasets, graph_reindexer, device, use_tgn, x_is_tuple=False):
     for dataset in datasets:
         for data_list in dataset:
-            for batch in log_tqdm(data_list, desc="Reindexing graphs"):
-                batch.to(device)
-                graph_reindexer.reindex_graph(batch, use_tgn=use_tgn, x_is_tuple=x_is_tuple)
-                batch.to("cpu")
+            if isinstance(data_list, LazyBatchList):
+                # Disk-backed: load each batch, reindex, save back. Only one
+                # batch is resident at a time.
+                for i in log_tqdm(range(len(data_list)), desc="Reindexing graphs"):
+                    path = data_list._path(i)
+                    batch = torch.load(path, map_location="cpu")
+                    batch.to(device)
+                    graph_reindexer.reindex_graph(
+                        batch, use_tgn=use_tgn, x_is_tuple=x_is_tuple
+                    )
+                    batch.to("cpu")
+                    torch.save(batch, path)
+                    batch = None
+            else:
+                for batch in log_tqdm(data_list, desc="Reindexing graphs"):
+                    batch.to(device)
+                    graph_reindexer.reindex_graph(
+                        batch, use_tgn=use_tgn, x_is_tuple=x_is_tuple
+                    )
+                    batch.to("cpu")

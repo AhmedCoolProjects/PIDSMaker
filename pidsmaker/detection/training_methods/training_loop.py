@@ -10,6 +10,7 @@ Handles model training with:
 """
 
 import copy
+import gc
 import tracemalloc
 from time import perf_counter as timer
 
@@ -55,11 +56,13 @@ def main(cfg):
     tracemalloc.start()
 
     train_data, val_data, test_data, max_node_num = get_preprocessed_graphs(cfg)
+    gc.collect()
 
     model = build_model(
         data_sample=train_data[0][0], device=device, cfg=cfg, max_node_num=max_node_num
     )
     optimizer = optimizer_factory(cfg, parameters=set(model.parameters()))
+    gc.collect()
 
     run_evaluation = cfg.training_loop.run_evaluation
     assert run_evaluation in ["best_epoch", "each_epoch"], (
@@ -95,10 +98,14 @@ def main(cfg):
             model.to_fine_tuning(False)
 
             loss_acc = torch.zeros(1, device=device)
-            tot_loss = 0
+            # Accumulate loss on-device; .item() once at epoch end. The
+            # previous tot_loss += loss.item() forced a CUDA sync after
+            # every batch, which made tiny-batch training GPU-idle on the
+            # A100 even though kernels were available.
+            tot_loss_t = torch.zeros(1, device=device)
             for dataset in train_data:
                 for i, g in enumerate(log_tqdm(dataset, "Training")):
-                    g.to(device=device)
+                    g.to(device=device, non_blocking=True)
                     g = remove_attacks_if_needed(g, cfg)
                     model.train()
                     optimizer.zero_grad()
@@ -106,28 +113,32 @@ def main(cfg):
                     results = model(g)
                     loss = results["loss"]
                     loss_acc += loss
-                    tot_loss += loss.item()
+                    tot_loss_t += loss.detach()
 
                     if (i + 1) % grad_acc == 0:
                         loss_acc.backward()
                         optimizer.step()
                         loss_acc = torch.zeros(1, device=device)
 
+                    # Move batch back to CPU so its GPU tensors are reclaimed
+                    # by the caching allocator. Do NOT call empty_cache() per
+                    # batch — that returns memory to the driver and forces the
+                    # next allocation to hit cudaMalloc, stalling the GPU.
                     g.to("cpu")
-                    if use_cuda:
-                        torch.cuda.empty_cache()
 
                 # Last batch
                 if loss_acc > 0:
                     loss_acc.backward()
                     optimizer.step()
 
+            tot_loss = float(tot_loss_t.item())
             tot_loss /= sum(len(dataset) for dataset in train_data)
             epoch_times.append(timer() - start)
 
             _, peak_inference_cpu_memory = tracemalloc.get_traced_memory()
             peak_train_cpu_mem = max(peak_train_cpu_mem, peak_inference_cpu_memory / (1024**3))
             tracemalloc.stop()
+            gc.collect()
 
             if use_cuda:
                 peak_inference_gpu_memory = torch.cuda.max_memory_allocated(device=device) / (
@@ -153,18 +164,18 @@ def main(cfg):
                 model.reset_state()
 
                 loss_acc = torch.zeros(1, device=device)
-                tot_loss = 0
+                tot_loss_t = torch.zeros(1, device=device)
                 for dataset in train_data:
                     for g in log_tqdm(dataset, "Fine-tuning"):
                         if 1 in g.y:
-                            g.to(device=device)
+                            g.to(device=device, non_blocking=True)
                             model.train()
                             optimizer.zero_grad()
 
                             results = model(g)
                             loss = results["loss"]
                             loss_acc += loss
-                            tot_loss += loss.item()
+                            tot_loss_t += loss.detach()
 
                             if (i + 1) % grad_acc == 0:
                                 loss_acc.backward()
@@ -172,14 +183,13 @@ def main(cfg):
                                 loss_acc = torch.zeros(1, device=device)
 
                             g.to("cpu")
-                            if use_cuda:
-                                torch.cuda.empty_cache()
 
                     # Last batch
                     if loss_acc > 0:
                         loss_acc.backward()
                         optimizer.step()
 
+                tot_loss = float(tot_loss_t.item())
                 tot_loss /= sum(len(dataset) for dataset in train_data)
 
                 # Validation
@@ -245,6 +255,9 @@ def main(cfg):
             )
 
     # After training
+    del train_data
+    gc.collect()
+
     if best_epoch_mode:
         model.load_state_dict(best_model)
         test_stats = inference_loop.main(
@@ -256,24 +269,24 @@ def main(cfg):
             split="test",
         )
 
-    wandb.log(
-        {
-            "best_epoch": best_epoch,
-            "train_epoch_time": round(np.mean(epoch_times), 2),
-            "val_score": round(best_val_score, 5),
-            "peak_train_cpu_memory": round(peak_train_cpu_mem, 3),
-            "peak_train_gpu_memory": round(peak_train_gpu_mem, 3),
-            "peak_inference_cpu_memory": round(
-                np.max([d["peak_inference_cpu_memory"] for d in all_test_stats]), 3
-            ),
-            "peak_inference_gpu_memory": round(
-                np.max([d["peak_inference_gpu_memory"] for d in all_test_stats]), 3
-            ),
-            "time_per_batch_inference": round(
-                np.mean([d["time_per_batch_inference"] for d in all_test_stats]), 3
-            ),
-        }
-    )
+    train_log = {
+        "best_epoch": best_epoch,
+        "train_epoch_time": round(np.mean(epoch_times), 2) if epoch_times else 0,
+        "val_score": round(best_val_score, 5),
+        "peak_train_cpu_memory": round(peak_train_cpu_mem, 3),
+        "peak_train_gpu_memory": round(peak_train_gpu_mem, 3),
+    }
+    if all_test_stats:
+        train_log["peak_inference_cpu_memory"] = round(
+            np.max([d["peak_inference_cpu_memory"] for d in all_test_stats]), 3
+        )
+        train_log["peak_inference_gpu_memory"] = round(
+            np.max([d["peak_inference_gpu_memory"] for d in all_test_stats]), 3
+        )
+        train_log["time_per_batch_inference"] = round(
+            np.mean([d["time_per_batch_inference"] for d in all_test_stats]), 3
+        )
+    wandb.log(train_log)
 
     return best_val_score
 

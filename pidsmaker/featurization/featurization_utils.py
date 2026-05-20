@@ -65,12 +65,14 @@ def get_corpus_using_neighbors_features(cfg, doc2vec_format=False):
     splits = get_splits_to_train_featurization(cfg)
     dates = list(chain.from_iterable([getattr(cfg.dataset, f"{split}_dates") for split in splits]))
     sorted_paths = get_all_graphs_for_dates(cfg.transformation._graphs_dir, dates)
-    graph_list = [torch.load(path) for path in sorted_paths]
 
     words = []
     nodes = set()
-    for G in log_tqdm(graph_list, desc="Get corpus with neighbors"):
-        # Prepare the training data for Doc2Vec: each node and its neighbors as a 'document'
+    # Stream graphs one-at-a-time. The previous `[torch.load(p) for p in ...]`
+    # held every NetworkX graph for the chosen splits in RAM at once, which
+    # is multi-GB on big datasets.
+    for path in log_tqdm(sorted_paths, desc="Get corpus with neighbors"):
+        G = torch.load(path)
         for node in G.nodes():
             if node not in nodes:
                 nodes.add(node)
@@ -92,5 +94,6 @@ def get_corpus_using_neighbors_features(cfg, doc2vec_format=False):
                     words.append(TaggedDocument(words=document, tags=[node]))
                 else:
                     words.append(document)
+        del G
 
     return words

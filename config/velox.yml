@@ -3,6 +3,7 @@
 _include_yml: orthrus_non_snooped
 
 batching:
+  lazy_test_data: True
   intra_graph_batching:
     used_methods: edges
 training:

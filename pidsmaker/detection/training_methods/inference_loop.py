@@ -214,7 +214,8 @@ def test_node_level(
             x_test_std = x_test_sampled.std(axis=0)
             x_test_sampled = (x_test_sampled - x_test_mean) / x_test_std
 
-            torch.cuda.empty_cache()
+            # Skip per-graph empty_cache(); same reasoning as in the main
+            # inference loop — it stalls the GPU on the next batch.
             x_test_sampled = pd.DataFrame.from_records(x_test_sampled)
 
             n_neighbors = 10
@@ -292,9 +293,12 @@ def main(cfg, model, val_data, test_data, epoch, split, logging=True):
         tracemalloc.start()
 
         all_losses = []
-        for graphs in dataset:
+        # Materialise the iterator once so a LazyTestData proxy loads its
+        # payload exactly once per evaluation (not on every nested access).
+        iterable = list(iter(dataset)) if hasattr(dataset, "_load") else dataset
+        for graphs in iterable:
             for g in log_tqdm(graphs, desc=desc, logging=logging):
-                g.to(device=device)
+                g.to(device=device, non_blocking=True)
 
                 s = time.time()
                 test_fn = test_node_level if cfg._is_node_level else test_edge_level
@@ -309,9 +313,11 @@ def main(cfg, model, val_data, test_data, epoch, split, logging=True):
                 all_losses.extend(losses)
                 tpb.append(time.time() - s)
 
-                g.to("cpu")  # Move graph back to CPU to free GPU memory for next batch
-                if use_cuda:
-                    torch.cuda.empty_cache()
+                # Move graph back to CPU so its GPU tensors are reclaimed by
+                # the caching allocator. Skip the per-batch empty_cache() —
+                # that returns memory to the driver and forces the next
+                # allocation through cudaMalloc, stalling the GPU.
+                g.to("cpu")
 
         _, peak_inference_cpu_memory = tracemalloc.get_traced_memory()
         peak_inference_cpu_mem = max(peak_inference_cpu_mem, peak_inference_cpu_memory / (1024**3))
@@ -321,6 +327,12 @@ def main(cfg, model, val_data, test_data, epoch, split, logging=True):
             peak_inference_gpu_memory = torch.cuda.max_memory_allocated(device=device) / (1024**3)
             peak_inference_gpu_mem = max(peak_inference_gpu_mem, peak_inference_gpu_memory)
             torch.cuda.reset_peak_memory_stats(device=device)
+
+        # If the dataset was a LazyTestData proxy, drop its in-RAM cache now
+        # so the training loop doesn't carry it forward between evaluations.
+        del iterable
+        if hasattr(dataset, "release"):
+            dataset.release()
 
         mean_loss = np.mean(all_losses)
         split2loss[split_name] = mean_loss

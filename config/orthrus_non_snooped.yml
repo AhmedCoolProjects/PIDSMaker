@@ -5,7 +5,12 @@ _include_yml: orthrus
 
 featurization:
   training_split: train
-  
+
+batching:
+  lazy_test_data: True
+  mmap_full_data: True
+  lazy_batches: True
+
 training:
   lr: 0.0001
   node_out_dim: 128

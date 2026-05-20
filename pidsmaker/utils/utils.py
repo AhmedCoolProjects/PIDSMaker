@@ -165,6 +165,24 @@ def init_database_connection(cfg):
     return cur, connect
 
 
+def stream_query(connect, sql, itersize=10000, name="pidsmaker_stream"):
+    """Stream rows from Postgres using a server-side named cursor.
+
+    Avoids loading entire result sets into Python memory at once. The default
+    `itersize` (10k) controls the network/round-trip batch size; rows are
+    yielded one-by-one to the caller. The cursor is closed on exhaustion or
+    on exception.
+    """
+    server_cursor = connect.cursor(name=name)
+    server_cursor.itersize = itersize
+    try:
+        server_cursor.execute(sql)
+        for row in server_cursor:
+            yield row
+    finally:
+        server_cursor.close()
+
+
 def std(t):
     t = np.array(t)
     return np.std(t)
@@ -676,6 +694,13 @@ def generate_DAG(edges):
 
 def log_dataset_stats(datasets):
     def log_helper(label, dataset):
+        # Disk-backed (LazyBatchList) — log just the count to avoid forcing a
+        # full-disk scan that would defeat the purpose of streaming batches.
+        if hasattr(dataset, "_dir") and hasattr(dataset, "_n"):
+            log(f"{label} num graphs: {len(dataset)} (disk-backed)")
+            log("")
+            return
+
         edges = torch.tensor([d.src.shape[0] for d in dataset])
         nodes = torch.tensor([torch.unique(d.edge_index).shape[0] for d in dataset])
 

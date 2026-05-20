@@ -859,6 +859,30 @@ TASK_ARGS = {
             desc="Whether to store the graphs on disk upon building the graphs. \
             Used to avoid re-computation of very complex batching operations that take time. Can take up to 300GB storage for CADETS_E5.",
         ),
+        "lazy_test_data": Arg(
+            bool,
+            desc="If True, after batching, test_data is serialized to disk and dropped \
+            from RAM until evaluation needs it. Cuts peak resident memory during \
+            training on huge datasets where test_data alone can be 50+GB.",
+        ),
+        "mmap_full_data": Arg(
+            bool,
+            desc="If True (and TGN last-neighbor batching is in use), build the \
+            global per-edge msg / t / edge_type / src / dst tensors incrementally \
+            on disk and access them via memory mapping. Avoids the in-RAM \
+            concatenation peak which is otherwise an extra copy of the entire \
+            edge stream — the single biggest contributor to >300GB resident \
+            usage on TRACE_E5 / FIVEDIRECTIONS_E5. Requires fast local storage.",
+        ),
+        "lazy_batches": Arg(
+            bool,
+            desc="If True, after all batching (compute_tgn_graphs / reindexing / \
+            inter-graph), each prepared batch is serialized to its own .pt file \
+            and the in-RAM list is replaced by a LazyBatchList that loads one \
+            batch at a time during training/eval. Cuts CPU RAM by the size of \
+            the precomputed *_tgn neighbor tensors (often 100-200GB for big \
+            TGN runs). Adds a small per-batch disk read; works best with NVMe.",
+        ),
         "node_features": Arg(
             str,
             vals=AND(["node_type", "node_emb", "only_ones", "edges_distribution"]),

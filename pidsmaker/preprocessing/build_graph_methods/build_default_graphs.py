@@ -23,6 +23,7 @@ from pidsmaker.utils.utils import (
     log_start,
     log_tqdm,
     ns_time_to_datetime_US,
+    stream_query,
     stringtomd5,
 )
 
@@ -63,16 +64,9 @@ def compute_indexid2msg(cfg):
             label_str = stringtomd5(label_str)
         return label_str
 
-    # netflow
-    sql = """
-        select * from netflow_node_table;
-        """
-    cur.execute(sql)
-    records = cur.fetchall()
-
-    log(f"Number of netflow nodes: {len(records)}")
-
-    for i in records:
+    # netflow — stream rows so we never hold the whole table in Python memory
+    n_netflow = 0
+    for i in stream_query(connect, "select * from netflow_node_table;", name="pids_netflow"):
         attrs = {
             "type": "netflow",
             "local_ip": str(i[2]),
@@ -85,40 +79,32 @@ def compute_indexid2msg(cfg):
         label_str = get_label_str_from_features(attrs, node_type)
 
         indexid2msg[index_id] = [node_type, label_str]
+        n_netflow += 1
+    log(f"Number of netflow nodes: {n_netflow}")
 
     # subject
-    sql = """
-    select * from subject_node_table;
-    """
-    cur.execute(sql)
-    records = cur.fetchall()
-
-    log(f"Number of process nodes: {len(records)}")
-
-    for i in records:
+    n_subject = 0
+    for i in stream_query(connect, "select * from subject_node_table;", name="pids_subject"):
         attrs = {"type": "subject", "path": str(i[2]), "cmd_line": str(i[3])}
         index_id = str(i[-1])
         node_type = attrs["type"]
         label_str = get_label_str_from_features(attrs, node_type)
 
         indexid2msg[index_id] = [node_type, label_str]
+        n_subject += 1
+    log(f"Number of process nodes: {n_subject}")
 
     # file
-    sql = """
-    select * from file_node_table;
-    """
-    cur.execute(sql)
-    records = cur.fetchall()
-
-    log(f"Number of file nodes: {len(records)}")
-
-    for i in records:
+    n_file = 0
+    for i in stream_query(connect, "select * from file_node_table;", name="pids_file"):
         attrs = {"type": "file", "path": str(i[2])}
         index_id = str(i[-1])
         node_type = attrs["type"]
         label_str = get_label_str_from_features(attrs, node_type)
 
         indexid2msg[index_id] = [node_type, label_str]
+        n_file += 1
+    log(f"Number of file nodes: {n_file}")
 
     return indexid2msg  # {index_id: [node_type, msg]}
 
@@ -161,11 +147,15 @@ def compute_and_save_split2nodes(cfg):
     split_to_files = get_split_to_files(cfg, cfg.construction._graphs_dir)
     split2nodes = defaultdict(set)
 
+    # Stream one graph at a time. The previous list-comprehension form held
+    # every NetworkX MultiDiGraph for a split in RAM simultaneously, which
+    # is multi-GB-per-split on large datasets and produced spikes during a
+    # step that only needs the node id sets.
     for split, files in split_to_files.items():
-        graph_list = [torch.load(path) for path in files]
-        for G in log_tqdm(graph_list, desc=f"Check nodes in {split} set"):
-            for node in G.nodes():
-                split2nodes[split].add(node)
+        for path in log_tqdm(files, desc=f"Check nodes in {split} set"):
+            G = torch.load(path)
+            split2nodes[split].update(G.nodes())
+            del G
     split2nodes = dict(split2nodes)
 
     out_dir = cfg.construction._dicts_dir
@@ -205,18 +195,128 @@ def gen_edge_fused_tw(indexid2msg, cfg):
     else:
         attack_mimicry_events = defaultdict(list)
 
-    def get_batches(arr, batch_size):
-        """Yield consecutive batches of specified size from array.
+    def _build_and_save_graph(temp_list, start_time, end_event_ts, date, cfg, indexid2msg):
+        """Build a NetworkX MultiDiGraph from the buffered window events and save it.
 
-        Args:
-            arr: Input array to batch
-            batch_size: Number of elements per batch
-
-        Yields:
-            list: Batches of size batch_size (last batch may be smaller)
+        Extracted as a helper so the streaming driver below stays readable. Logic
+        mirrors the original inline build: optional edge fusion, then graph
+        materialization, then torch.save.
         """
-        for i in range(0, len(arr), batch_size):
-            yield arr[i : i + batch_size]
+        time_interval = (
+            ns_time_to_datetime_US(start_time) + "~" + ns_time_to_datetime_US(end_event_ts)
+        )
+
+        node_info = {}
+        edge_list = []
+        if cfg.construction.fuse_edge:
+            edge_info = {}
+            for (
+                _src_node,
+                src_index_id,
+                operation,
+                _dst_node,
+                dst_index_id,
+                event_uuid,
+                timestamp_rec,
+                _id,
+            ) in temp_list:
+                if src_index_id not in node_info:
+                    node_type, label = indexid2msg[src_index_id]
+                    node_info[src_index_id] = {"label": label, "node_type": node_type}
+                if dst_index_id not in node_info:
+                    node_type, label = indexid2msg[dst_index_id]
+                    node_info[dst_index_id] = {"label": label, "node_type": node_type}
+
+                if (src_index_id, dst_index_id) not in edge_info:
+                    edge_info[(src_index_id, dst_index_id)] = []
+
+                edge_info[(src_index_id, dst_index_id)].append(
+                    (timestamp_rec, operation, event_uuid)
+                )
+
+            for (src, dst), data in edge_info.items():
+                sorted_data = sorted(data, key=lambda x: x[0])
+                operation_list = [entry[1] for entry in sorted_data]
+
+                indices = []
+                current_type = None
+                current_start_index = None
+
+                for idx, item in enumerate(operation_list):
+                    if item == current_type:
+                        continue
+                    else:
+                        if current_type is not None and current_start_index is not None:
+                            indices.append(current_start_index)
+                        current_type = item
+                        current_start_index = idx
+
+                if current_type is not None and current_start_index is not None:
+                    indices.append(current_start_index)
+
+                for k in indices:
+                    edge_list.append(
+                        {
+                            "src": src,
+                            "dst": dst,
+                            "time": sorted_data[k][0],
+                            "label": sorted_data[k][1],
+                            "event_uuid": sorted_data[k][2],
+                        }
+                    )
+        else:
+            for (
+                _src_node,
+                src_index_id,
+                operation,
+                _dst_node,
+                dst_index_id,
+                event_uuid,
+                timestamp_rec,
+                _id,
+            ) in temp_list:
+                if src_index_id not in node_info:
+                    node_type, label = indexid2msg[src_index_id]
+                    node_info[src_index_id] = {"label": label, "node_type": node_type}
+                if dst_index_id not in node_info:
+                    node_type, label = indexid2msg[dst_index_id]
+                    node_info[dst_index_id] = {"label": label, "node_type": node_type}
+
+                edge_list.append(
+                    {
+                        "src": src_index_id,
+                        "dst": dst_index_id,
+                        "time": timestamp_rec,
+                        "label": operation,
+                        "event_uuid": event_uuid,
+                    }
+                )
+
+        graph = nx.MultiDiGraph()
+
+        for node, info in node_info.items():
+            graph.add_node(node, node_type=info["node_type"], label=info["label"])
+
+        for i, edge in enumerate(edge_list):
+            graph.add_edge(
+                edge["src"],
+                edge["dst"],
+                event_uuid=edge["event_uuid"],
+                time=edge["time"],
+                label=edge["label"],
+                y=0,
+            )
+
+            # For unit tests, we only want few edges
+            NUM_TEST_EDGES = 2000
+            if cfg._test_mode and i >= NUM_TEST_EDGES:
+                break
+
+        date_dir = f"{cfg.construction._graphs_dir}/graph_{date}/"
+        os.makedirs(date_dir, exist_ok=True)
+        graph_name = f"{date_dir}/{time_interval}"
+
+        torch.save(graph, graph_name)
 
     # In test mode, we ensure to get 1 TW in each set
     dates = get_dates_from_cfg(cfg)
@@ -251,220 +351,67 @@ def gen_edge_fused_tw(indexid2msg, cfg):
                     mimicry_events.extend(attack_mimicry_events[attack_index])
                 attack_index += 1
 
-            sql = """
-            select * from event_table
-            where
-                  timestamp_rec>'%s' and timestamp_rec<'%s'
-                   ORDER BY timestamp_rec, event_uuid;
-            """ % (start_ns_timestamp, end_ns_timestamp)
-            cur.execute(sql)
-            events = cur.fetchall()
+            sql = (
+                "select * from event_table "
+                f"where timestamp_rec>'{start_ns_timestamp}' and timestamp_rec<'{end_ns_timestamp}' "
+                "ORDER BY timestamp_rec, event_uuid;"
+            )
 
-            if len(events) == 0:
-                continue
+            # Stream events from Postgres instead of fetchall — for huge days
+            # (TRACE_E5, FIVEDIRECTIONS_E5, ...) the previous fetchall held
+            # tens of millions of tuples in RAM and was duplicated into
+            # `events_list`. We now consume the cursor row-by-row, filter on
+            # the fly, append mimicry events at the end, and emit graphs once
+            # the rolling buffer crosses the time-window threshold.
+            def filtered_event_stream(_sql=sql, _mimicry=mimicry_events):
+                for row in stream_query(connect, _sql, name="pids_events"):
+                    if row[2] in include_edge_type:  # operation filter
+                        yield row
+                for row in _mimicry:
+                    if row[2] in include_edge_type:
+                        yield row
 
-            events_list = []
-            for (
-                src_node,
-                src_index_id,
-                operation,
-                dst_node,
-                dst_index_id,
-                event_uuid,
-                timestamp_rec,
-                _id,
-            ) in events:
-                if operation in include_edge_type:
-                    event_tuple = (
-                        src_node,
-                        src_index_id,
-                        operation,
-                        dst_node,
-                        dst_index_id,
-                        event_uuid,
-                        timestamp_rec,
-                        _id,
-                    )
-                    events_list.append(event_tuple)
-
-            for (
-                src_node,
-                src_index_id,
-                operation,
-                dst_node,
-                dst_index_id,
-                event_uuid,
-                timestamp_rec,
-                _id,
-            ) in mimicry_events:
-                if operation in include_edge_type:
-                    event_tuple = (
-                        src_node,
-                        src_index_id,
-                        operation,
-                        dst_node,
-                        dst_index_id,
-                        event_uuid,
-                        timestamp_rec,
-                        _id,
-                    )
-                    events_list.append(event_tuple)
-
-            start_time = events_list[0][-2]
-            temp_list = []
             BATCH = 1024
             window_size_in_ns = cfg.construction.time_window_size * 60_000_000_000
 
-            last_batch = False
-            for batch_edges in get_batches(events_list, BATCH):
-                for j in batch_edges:
-                    temp_list.append(j)
+            stream = filtered_event_stream()
+            temp_list = []
+            start_time = None  # first event ts of the current window
+            stream_exhausted = False
 
-                if (len(batch_edges) < BATCH) or (temp_list[-1] == events_list[-1]):
-                    last_batch = True
+            while not stream_exhausted:
+                # Pull up to BATCH events; stop early if stream ends.
+                batch_buf = []
+                for _ in range(BATCH):
+                    try:
+                        batch_buf.append(next(stream))
+                    except StopIteration:
+                        stream_exhausted = True
+                        break
 
-                if (batch_edges[-1][-2] > start_time + window_size_in_ns) or last_batch:
-                    time_interval = (
-                        ns_time_to_datetime_US(start_time)
-                        + "~"
-                        + ns_time_to_datetime_US(batch_edges[-1][-2])
+                if not batch_buf:
+                    break  # no rows at all (or no more), nothing to flush
+                if start_time is None:
+                    start_time = batch_buf[0][-2]
+
+                temp_list.extend(batch_buf)
+                last_event_ts = batch_buf[-1][-2]
+                last_batch = stream_exhausted
+
+                if (last_event_ts > start_time + window_size_in_ns) or last_batch:
+                    _build_and_save_graph(
+                        temp_list=temp_list,
+                        start_time=start_time,
+                        end_event_ts=last_event_ts,
+                        date=date,
+                        cfg=cfg,
+                        indexid2msg=indexid2msg,
                     )
 
-                    # log(f"Start create edge fused time window graph for {time_interval}")
-
-                    node_info = {}
-                    edge_list = []
-                    if cfg.construction.fuse_edge:
-                        edge_info = {}
-                        for (
-                            src_node,
-                            src_index_id,
-                            operation,
-                            dst_node,
-                            dst_index_id,
-                            event_uuid,
-                            timestamp_rec,
-                            _id,
-                        ) in temp_list:
-                            if src_index_id not in node_info:
-                                node_type, label = indexid2msg[src_index_id]
-                                node_info[src_index_id] = {
-                                    "label": label,
-                                    "node_type": node_type,
-                                }
-                            if dst_index_id not in node_info:
-                                node_type, label = indexid2msg[dst_index_id]
-                                node_info[dst_index_id] = {
-                                    "label": label,
-                                    "node_type": node_type,
-                                }
-
-                            if (src_index_id, dst_index_id) not in edge_info:
-                                edge_info[(src_index_id, dst_index_id)] = []
-
-                            edge_info[(src_index_id, dst_index_id)].append(
-                                (timestamp_rec, operation, event_uuid)
-                            )
-
-                        for (src, dst), data in edge_info.items():
-                            sorted_data = sorted(data, key=lambda x: x[0])
-                            operation_list = [entry[1] for entry in sorted_data]
-
-                            indices = []
-                            current_type = None
-                            current_start_index = None
-
-                            for idx, item in enumerate(operation_list):
-                                if item == current_type:
-                                    continue
-                                else:
-                                    if current_type is not None and current_start_index is not None:
-                                        indices.append(current_start_index)
-                                    current_type = item
-                                    current_start_index = idx
-
-                            if current_type is not None and current_start_index is not None:
-                                indices.append(current_start_index)
-
-                            for k in indices:
-                                edge_list.append(
-                                    {
-                                        "src": src,
-                                        "dst": dst,
-                                        "time": sorted_data[k][0],
-                                        "label": sorted_data[k][1],
-                                        "event_uuid": sorted_data[k][2],
-                                    }
-                                )
-                    else:
-                        for (
-                            src_node,
-                            src_index_id,
-                            operation,
-                            dst_node,
-                            dst_index_id,
-                            event_uuid,
-                            timestamp_rec,
-                            _id,
-                        ) in temp_list:
-                            if src_index_id not in node_info:
-                                node_type, label = indexid2msg[src_index_id]
-                                node_info[src_index_id] = {
-                                    "label": label,
-                                    "node_type": node_type,
-                                }
-                            if dst_index_id not in node_info:
-                                node_type, label = indexid2msg[dst_index_id]
-                                node_info[dst_index_id] = {
-                                    "label": label,
-                                    "node_type": node_type,
-                                }
-
-                            edge_list.append(
-                                {
-                                    "src": src_index_id,
-                                    "dst": dst_index_id,
-                                    "time": timestamp_rec,
-                                    "label": operation,
-                                    "event_uuid": event_uuid,
-                                }
-                            )
-
-                    # log(f"Start creating graph for {time_interval}")
-                    graph = nx.MultiDiGraph()
-
-                    for node, info in node_info.items():
-                        graph.add_node(node, node_type=info["node_type"], label=info["label"])
-
-                    for i, edge in enumerate(edge_list):
-                        graph.add_edge(
-                            edge["src"],
-                            edge["dst"],
-                            event_uuid=edge["event_uuid"],
-                            time=edge["time"],
-                            label=edge["label"],
-                            y=0,
-                        )
-
-                        # For unit tests, we only want few edges
-                        NUM_TEST_EDGES = 2000
-                        if cfg._test_mode and i >= NUM_TEST_EDGES:
-                            break
-
-                    date_dir = f"{cfg.construction._graphs_dir}/graph_{date}/"
-                    os.makedirs(date_dir, exist_ok=True)
-                    graph_name = f"{date_dir}/{time_interval}"
-
-                    # log(f"Saving graph for {time_interval}")
-                    torch.save(graph, graph_name)
-
-                    # log(f"[{time_interval}] Num of edges: {len(edge_list)}")
-                    # log(f"[{time_interval}] Num of events: {len(temp_list)}")
-                    # log(f"[{time_interval}] Num of nodes: {len(node_info.keys())}")
-                    start_time = batch_edges[-1][-2]
+                    start_time = last_event_ts
                     temp_list.clear()
 
-                    # For unit tests, we only edges from the first graph
+                    # For unit tests, we only keep edges from the first graph
                     if cfg._test_mode:
                         test_mode_set_done = True
                         break
